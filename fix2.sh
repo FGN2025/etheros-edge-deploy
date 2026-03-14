@@ -1,5 +1,5 @@
 #!/bin/bash
-# EtherOS — Fix: remove healthcheck blocks, start all services directly
+# EtherOS — Definitive fix: strip ALL healthcheck blocks from compose file
 set -e
 E=/opt/etheros-edge
 cd $E
@@ -7,7 +7,7 @@ cd $E
 echo "Stopping all containers..."
 docker compose down --remove-orphans 2>/dev/null || true
 
-echo "Rewriting docker-compose.yml without healthcheck dependencies..."
+echo "Writing clean docker-compose.yml (zero healthchecks)..."
 cat > $E/docker-compose.yml << 'DCEOF'
 name: etheros-edge
 
@@ -50,12 +50,7 @@ services:
     entrypoint: ["/bin/sh","-c"]
     command:
       - |
-        echo "Waiting for Ollama..."
-        until wget -qO- http://ollama:11434/ > /dev/null 2>&1; do
-          echo "  not ready yet, retrying..."
-          sleep 5
-        done
-        echo "Ollama ready. Pulling models..."
+        until ollama list > /dev/null 2>&1; do sleep 5; done
         ollama pull phi3:mini
         ollama pull nomic-embed-text
         echo "Models ready."
@@ -134,23 +129,18 @@ services:
       - prometheus
 DCEOF
 
-echo "Starting stack (no healthcheck dependencies)..."
+echo "Starting stack..."
 docker compose up -d
-
-echo ""
-echo "Waiting 15s..."
 sleep 15
 
 docker compose ps
 
 echo ""
-echo "--- Direct service checks ---"
-curl -sf http://localhost:11434/ && echo "Ollama: UP" || echo "Ollama: not yet ready (normal - wait 30s)"
-curl -sf http://localhost:3000/health && echo "Open WebUI: UP" || echo "Open WebUI: starting..."
+echo "--- Service checks from host ---"
+curl -sf http://localhost:11434/ && echo "Ollama: UP" || echo "Ollama: starting (wait 30s)"
 curl -sf http://localhost/health && echo "Nginx: UP" || echo "Nginx: check logs"
 echo ""
 echo "============================================"
-echo "  EtherOS Edge Node running at 72.62.160.72"
 echo "  Open WebUI : https://72.62.160.72/"
 echo "  Ollama API : https://72.62.160.72:8443/v1/"
 echo "  Grafana    : https://72.62.160.72/grafana/"
