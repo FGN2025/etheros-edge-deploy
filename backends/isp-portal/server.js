@@ -502,4 +502,144 @@ app.get('/api/revenue', (req, res) => {
   res.json(months);
 });
 
+
+// ── Terminal self-registration & heartbeat ────────────────────────────────────
+
+setInterval(() => {
+  try {
+    const terminals = loadJSON(TERMINALS_FILE);
+    const now = Date.now();
+    let changed = false;
+    terminals.forEach(t => {
+      if (t.status === 'online' && t.lastSeen) {
+        const age = now - new Date(t.lastSeen).getTime();
+        if (age > 3 * 60 * 1000) { t.status = 'offline'; changed = true; }
+      }
+    });
+    if (changed) saveJSON(TERMINALS_FILE, terminals);
+  } catch {}
+}, 60 * 1000);
+
+app.post('/api/terminals/register', (req, res) => {
+  const { hostname, ip, osVersion, modelVersion, tier } = req.body;
+  if (!hostname || !ip) return res.status(400).json({ error: 'hostname and ip are required' });
+  const terminals = loadJSON(TERMINALS_FILE);
+  let terminal = terminals.find(t => t.hostname === hostname);
+  if (terminal) {
+    terminal.ip = ip; terminal.status = 'online';
+    terminal.lastSeen = new Date().toISOString();
+    terminal.osVersion = osVersion || terminal.osVersion;
+    terminal.modelVersion = modelVersion || terminal.modelVersion;
+    saveJSON(TERMINALS_FILE, terminals);
+    return res.json({ ok: true, terminal, registered: false });
+  }
+  terminal = {
+    id: require('crypto').randomUUID(),
+    hostname, ip, tier: tier || 1, status: 'provisioning',
+    modelVersion: modelVersion || '', lastSeen: new Date().toISOString(),
+    osVersion: osVersion || 'EtherOS 1.0', cpuPercent: 0, ramPercent: 0,
+    diskPercent: 0, modelLoaded: '', lastInferenceTime: 0, uptime: '0m',
+    registeredAt: new Date().toISOString(),
+  };
+  terminals.push(terminal);
+  saveJSON(TERMINALS_FILE, terminals);
+  res.status(201).json({ ok: true, terminal, registered: true });
+});
+
+app.post('/api/terminals/:id/heartbeat', (req, res) => {
+  const terminals = loadJSON(TERMINALS_FILE);
+  const idx = terminals.findIndex(t => t.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Terminal not found — re-register' });
+  const { cpuPercent, ramPercent, diskPercent, modelLoaded, lastInferenceTime, uptime, modelVersion } = req.body;
+  terminals[idx] = {
+    ...terminals[idx], status: 'online', lastSeen: new Date().toISOString(),
+    cpuPercent: cpuPercent ?? terminals[idx].cpuPercent,
+    ramPercent: ramPercent ?? terminals[idx].ramPercent,
+    diskPercent: diskPercent ?? terminals[idx].diskPercent,
+    modelLoaded: modelLoaded ?? terminals[idx].modelLoaded,
+    lastInferenceTime: lastInferenceTime ?? terminals[idx].lastInferenceTime,
+    uptime: uptime ?? terminals[idx].uptime,
+    modelVersion: modelVersion ?? terminals[idx].modelVersion,
+  };
+  saveJSON(TERMINALS_FILE, terminals);
+  res.json({ ok: true, lastSeen: terminals[idx].lastSeen });
+});
+
+app.get('/api/terminals/:id', (req, res) => {
+  const terminals = loadJSON(TERMINALS_FILE);
+  const terminal = terminals.find(t => t.id === req.params.id);
+  if (!terminal) return res.status(404).json({ error: 'Not found' });
+  res.json(terminal);
+});
+
+
+// ── Terminal self-registration & heartbeat ────────────────────────────────────
+
+setInterval(() => {
+  try {
+    const terminals = loadJSON(TERMINALS_FILE);
+    const now = Date.now();
+    let changed = false;
+    terminals.forEach(t => {
+      if (t.status === 'online' && t.lastSeen) {
+        const age = now - new Date(t.lastSeen).getTime();
+        if (age > 3 * 60 * 1000) { t.status = 'offline'; changed = true; }
+      }
+    });
+    if (changed) saveJSON(TERMINALS_FILE, terminals);
+  } catch {}
+}, 60 * 1000);
+
+app.post('/api/terminals/register', (req, res) => {
+  const { hostname, ip, osVersion, modelVersion, tier } = req.body;
+  if (!hostname || !ip) return res.status(400).json({ error: 'hostname and ip are required' });
+  const terminals = loadJSON(TERMINALS_FILE);
+  let terminal = terminals.find(t => t.hostname === hostname);
+  if (terminal) {
+    terminal.ip = ip; terminal.status = 'online';
+    terminal.lastSeen = new Date().toISOString();
+    terminal.osVersion = osVersion || terminal.osVersion;
+    terminal.modelVersion = modelVersion || terminal.modelVersion;
+    saveJSON(TERMINALS_FILE, terminals);
+    return res.json({ ok: true, terminal, registered: false });
+  }
+  terminal = {
+    id: require('crypto').randomUUID(),
+    hostname, ip, tier: tier || 1, status: 'provisioning',
+    modelVersion: modelVersion || '', lastSeen: new Date().toISOString(),
+    osVersion: osVersion || 'EtherOS 1.0', cpuPercent: 0, ramPercent: 0,
+    diskPercent: 0, modelLoaded: '', lastInferenceTime: 0, uptime: '0m',
+    registeredAt: new Date().toISOString(),
+  };
+  terminals.push(terminal);
+  saveJSON(TERMINALS_FILE, terminals);
+  res.status(201).json({ ok: true, terminal, registered: true });
+});
+
+app.post('/api/terminals/:id/heartbeat', (req, res) => {
+  const terminals = loadJSON(TERMINALS_FILE);
+  const idx = terminals.findIndex(t => t.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Terminal not found — re-register' });
+  const { cpuPercent, ramPercent, diskPercent, modelLoaded, lastInferenceTime, uptime, modelVersion } = req.body;
+  terminals[idx] = {
+    ...terminals[idx], status: 'online', lastSeen: new Date().toISOString(),
+    cpuPercent: cpuPercent ?? terminals[idx].cpuPercent,
+    ramPercent: ramPercent ?? terminals[idx].ramPercent,
+    diskPercent: diskPercent ?? terminals[idx].diskPercent,
+    modelLoaded: modelLoaded ?? terminals[idx].modelLoaded,
+    lastInferenceTime: lastInferenceTime ?? terminals[idx].lastInferenceTime,
+    uptime: uptime ?? terminals[idx].uptime,
+    modelVersion: modelVersion ?? terminals[idx].modelVersion,
+  };
+  saveJSON(TERMINALS_FILE, terminals);
+  res.json({ ok: true, lastSeen: terminals[idx].lastSeen });
+});
+
+app.get('/api/terminals/:id', (req, res) => {
+  const terminals = loadJSON(TERMINALS_FILE);
+  const terminal = terminals.find(t => t.id === req.params.id);
+  if (!terminal) return res.status(404).json({ error: 'Not found' });
+  res.json(terminal);
+});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`ISP Portal backend v1.2.0 (Stripe) running on port ${PORT}`));
