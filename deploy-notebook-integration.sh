@@ -353,6 +353,9 @@ async function ollamaChat(model, messages) {
 }
 
 // ── Open Notebook context injection ───────────────────────────────────────────
+// Open Notebook API pattern (lfnovo/open-notebook):
+//   1. POST /api/search { query, notebook_id, limit } → { results: [{id, title, relevance}] }
+//   2. GET  /api/sources/{id}                         → { full_text, title, ... }
 async function fetchNotebookContext(connectorIds, userMessage) {
   if (!connectorIds || connectorIds.length === 0) return null;
 
@@ -377,40 +380,58 @@ async function fetchNotebookContext(connectorIds, userMessage) {
     try {
       const headers = { 'Content-Type': 'application/json' };
       if (conn.apiKey) headers['Authorization'] = `Bearer ${conn.apiKey}`;
+      const baseUrl = conn.baseUrl.replace(/\/$/, '');
 
-      // Use Open Notebook search endpoint to find relevant passages
-      const searchUrl = `${conn.baseUrl}/api/search`;
-      const searchRes = await fetch(searchUrl, {
+      // Step 1: Search for relevant sources
+      const searchRes = await fetch(`${baseUrl}/api/search`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ query: userMessage, notebook_id: conn.notebookId, limit: 5 }),
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
 
-      if (searchRes.ok) {
-        const searchData = await searchRes.json();
-        // Open Notebook returns results array with content/text fields
-        const results = searchData?.results || searchData?.items || [];
-        if (results.length > 0) {
-          const passages = results
-            .slice(0, 5)
-            .map(r => r.content || r.text || r.chunk || '')
-            .filter(Boolean)
-            .join('\n\n---\n\n');
+      if (!searchRes.ok) {
+        console.error(`Search failed for ${conn.name}: HTTP ${searchRes.status}`);
+        continue;
+      }
 
-          if (passages) {
-            contextParts.push(`[KNOWLEDGE BASE: ${conn.name}${conn.topic ? ` (${conn.topic})` : ''}]\n${passages}`);
+      const searchData = await searchRes.json();
+      const results = (searchData?.results || []).slice(0, 3); // top 3 most relevant
+      if (results.length === 0) continue;
+
+      // Step 2: Fetch full_text for each result
+      const passages = [];
+      for (const result of results) {
+        try {
+          const sourceRes = await fetch(`${baseUrl}/api/sources/${result.id}`, {
+            headers,
+            signal: AbortSignal.timeout(8000),
+          });
+          if (sourceRes.ok) {
+            const source = await sourceRes.json();
+            const text = source.full_text || source.content || source.text || '';
+            if (text) {
+              // Trim to 1500 chars per source to keep context manageable
+              passages.push(`Source: ${result.title}\n${text.slice(0, 1500)}${text.length > 1500 ? '...' : ''}`);
+            }
           }
+        } catch (err) {
+          console.error(`Source fetch failed for ${result.id}:`, err.message);
         }
       }
+
+      if (passages.length > 0) {
+        contextParts.push(`[KNOWLEDGE BASE: ${conn.name}${conn.topic ? ` (${conn.topic})` : ''}]\n\n${passages.join('\n\n---\n\n')}`);
+      }
+
     } catch (err) {
       console.error(`Notebook context fetch failed for ${conn.name}:`, err.message);
-      // Graceful degradation — continue without this connector's context
+      // Graceful degradation — continue without this connector
     }
   }
 
   if (contextParts.length === 0) return null;
-  return contextParts.join('\n\n');
+  return contextParts.join('\n\n==========\n\n');
 }
 
 // ── Notebook connectors proxy (for Marketplace frontend) ─────────────────────
