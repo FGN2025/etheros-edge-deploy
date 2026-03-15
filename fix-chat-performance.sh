@@ -224,9 +224,9 @@ print("  ✓ Patches applied")
 PYEOF
 
 echo "▸ Restarting marketplace backend container..."
-cd /opt/etheros-edge
-docker compose restart etheros-marketplace-backend
-sleep 3
+# Restart by container name (works regardless of compose service label)
+docker restart etheros-marketplace-backend
+sleep 4
 
 echo "▸ Verifying backend is healthy..."
 for i in 1 2 3 4 5; do
