@@ -1,0 +1,190 @@
+#!/bin/bash
+# Fix: Move static location blocks from port 8443 to port 443 server block
+set -e
+
+NGINX_CONF="/opt/etheros-edge/nginx/conf.d/etheros-edge.conf"
+BACKUP="/opt/etheros-edge/nginx/conf.d/etheros-edge.conf.bak-$(date +%Y%m%d-%H%M%S)"
+
+echo "=== Backing up nginx conf to $BACKUP ==="
+cp "$NGINX_CONF" "$BACKUP"
+
+echo "=== Rewriting nginx conf ==="
+cat > "$NGINX_CONF" << 'NGINXEOF'
+upstream open_webui {
+    server etheros-open-webui:8080;
+}
+
+upstream ollama_backend {
+    server etheros-ollama:11434;
+}
+
+upstream grafana_backend {
+    server etheros-grafana:3000;
+}
+
+upstream prometheus_backend {
+    server etheros-prometheus:9090;
+}
+
+# HTTP -> HTTPS redirect
+server {
+    listen 80;
+    server_name edge.etheros.ai;
+    return 301 https://$host$request_uri;
+}
+
+# Main HTTPS server - Let's Encrypt cert
+server {
+    listen 443 ssl;
+    server_name edge.etheros.ai;
+
+    ssl_certificate     /etc/letsencrypt/live/edge.etheros.ai/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/edge.etheros.ai/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size 100M;
+    proxy_read_timeout   300s;
+    proxy_send_timeout   300s;
+
+    # ── ISP Portal static SPA ────────────────────────────────────
+    location /isp-portal/ {
+        alias /opt/etheros-edge/static/isp-portal/;
+        try_files $uri $uri/ /isp-portal/index.html;
+        add_header Cache-Control "no-cache";
+    }
+    location /isp-portal/api/ {
+        proxy_pass http://etheros-isp-portal-backend:3010/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location /isp-portal/health {
+        proxy_pass http://etheros-isp-portal-backend:3010/health;
+    }
+
+    # ── Agent Marketplace static SPA ────────────────────────────
+    location /marketplace/ {
+        alias /opt/etheros-edge/static/marketplace/;
+        try_files $uri $uri/ /marketplace/index.html;
+        add_header Cache-Control "no-cache";
+    }
+    location /marketplace/api/ {
+        proxy_pass http://etheros-marketplace-backend:3011/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location /marketplace/health {
+        proxy_pass http://etheros-marketplace-backend:3011/health;
+    }
+
+    location /ollama/v1/ {
+        rewrite ^/ollama/v1/(.*)$ /v1/$1 break;
+        proxy_pass         http://ollama_backend;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    location /ollama/api/ {
+        rewrite ^/ollama/api/(.*)$ /api/$1 break;
+        proxy_pass         http://ollama_backend;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    location /api/ {
+        proxy_pass         http://open_webui;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+    }
+
+    location /ws/ {
+        proxy_pass         http://open_webui;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+
+    location /grafana/ {
+        proxy_pass         http://grafana_backend/;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        proxy_pass         http://open_webui;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+    }
+}
+
+# Port 8443 — mTLS terminal endpoint
+server {
+    listen 8443 ssl;
+    server_name edge.etheros.ai;
+
+    ssl_certificate     /etc/letsencrypt/live/edge.etheros.ai/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/edge.etheros.ai/privkey.pem;
+    ssl_client_certificate /etc/nginx/ssl/etheros-ca.crt;
+    ssl_verify_client   optional;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    location /v1/ {
+        proxy_pass http://ollama_backend/v1/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Client-Verified $ssl_client_verify;
+        proxy_set_header X-Client-DN $ssl_client_s_dn;
+    }
+}
+NGINXEOF
+
+echo "=== Testing nginx config ==="
+docker exec etheros-nginx nginx -t
+
+if [ $? -eq 0 ]; then
+    echo "=== Config OK — reloading nginx ==="
+    docker exec etheros-nginx nginx -s reload
+    sleep 2
+
+    echo ""
+    echo "=== Verifying ==="
+    echo -n "  https://edge.etheros.ai/marketplace/ → "
+    curl -s -o /dev/null -w "%{http_code}\n" https://edge.etheros.ai/marketplace/
+    echo -n "  https://edge.etheros.ai/isp-portal/ → "
+    curl -s -o /dev/null -w "%{http_code}\n" https://edge.etheros.ai/isp-portal/
+    echo ""
+    echo "=== DONE — both should be 200 ==="
+else
+    echo "=== Config test FAILED — restoring backup ==="
+    cp "$BACKUP" "$NGINX_CONF"
+    echo "Restored from backup. No changes made."
+fi
