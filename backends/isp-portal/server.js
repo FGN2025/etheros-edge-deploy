@@ -369,35 +369,134 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'isp-portal-b
 
 const PORT = process.env.PORT || 3010;
 
+
+// ── JSON file storage helpers ─────────────────────────────────────────────────
+const TERMINALS_FILE   = '/app/data/terminals.json';
+const SUBSCRIBERS_FILE = '/app/data/subscribers.json';
+
+function loadJSON(file, fallback = []) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return fallback; }
+}
+function saveJSON(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+// ── Terminals ────────────────────────────────────────────────────────────────
+app.get('/api/terminals', (req, res) => {
+  res.json(loadJSON(TERMINALS_FILE));
+});
+
+app.post('/api/terminals', (req, res) => {
+  const { hostname, ip, tier, status } = req.body;
+  if (!hostname || !ip) return res.status(400).json({ error: 'hostname and ip are required' });
+  const terminals = loadJSON(TERMINALS_FILE);
+  const terminal = {
+    id: require('crypto').randomUUID(),
+    hostname, ip,
+    tier: tier || 1,
+    status: status || 'provisioning',
+    modelVersion: '', lastSeen: new Date().toISOString(),
+    osVersion: 'EtherOS 1.0', cpuPercent: 0, ramPercent: 0,
+    diskPercent: 0, modelLoaded: '', lastInferenceTime: 0, uptime: '0m',
+  };
+  terminals.push(terminal);
+  saveJSON(TERMINALS_FILE, terminals);
+  res.status(201).json(terminal);
+});
+
+app.patch('/api/terminals/:id', (req, res) => {
+  const terminals = loadJSON(TERMINALS_FILE);
+  const idx = terminals.findIndex(t => t.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+  terminals[idx] = { ...terminals[idx], ...req.body, id: terminals[idx].id };
+  saveJSON(TERMINALS_FILE, terminals);
+  res.json(terminals[idx]);
+});
+
+app.delete('/api/terminals/:id', (req, res) => {
+  const terminals = loadJSON(TERMINALS_FILE);
+  const filtered = terminals.filter(t => t.id !== req.params.id);
+  if (filtered.length === terminals.length) return res.status(404).json({ error: 'Not found' });
+  saveJSON(TERMINALS_FILE, filtered);
+  res.json({ ok: true });
+});
+
+// ── Subscribers ──────────────────────────────────────────────────────────────
+const PLAN_PRICES = { personal: 14.99, professional: 39.99, charter: 99.99 };
+
+app.get('/api/subscribers', (req, res) => {
+  res.json(loadJSON(SUBSCRIBERS_FILE));
+});
+
+app.post('/api/subscribers', (req, res) => {
+  const { name, email, plan } = req.body;
+  if (!name || !email || !plan) return res.status(400).json({ error: 'name, email and plan are required' });
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  if (subscribers.find(s => s.email === email)) return res.status(409).json({ error: 'Email already exists' });
+  const subscriber = {
+    id: require('crypto').randomUUID(),
+    name, email, plan, status: 'active',
+    agentsActive: 0, monthlySpend: PLAN_PRICES[plan] || 0,
+    joinedAt: new Date().toISOString(), agents: [],
+    billingHistory: [{ date: new Date().toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}), amount: 0, status: 'trial' }],
+  };
+  subscribers.push(subscriber);
+  saveJSON(SUBSCRIBERS_FILE, subscribers);
+  res.status(201).json(subscriber);
+});
+
+app.patch('/api/subscribers/:id', (req, res) => {
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const idx = subscribers.findIndex(s => s.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+  subscribers[idx] = { ...subscribers[idx], ...req.body, id: subscribers[idx].id };
+  saveJSON(SUBSCRIBERS_FILE, subscribers);
+  res.json(subscribers[idx]);
+});
+
+app.delete('/api/subscribers/:id', (req, res) => {
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const filtered = subscribers.filter(s => s.id !== req.params.id);
+  if (filtered.length === subscribers.length) return res.status(404).json({ error: 'Not found' });
+  saveJSON(SUBSCRIBERS_FILE, filtered);
+  res.json({ ok: true });
+});
+
 // ── Dashboard KPIs ──────────────────────────────────────────────────────────
 app.get('/api/dashboard', (req, res) => {
-  res.json({
-    totalTerminals: 0,
-    online: 0,
-    offline: 0,
-    provisioning: 0,
-    activeSubscribers: 0,
-    monthlyRevenue: 0,
-    prevMonthlyRevenue: 0,
-    arpu: 0,
-    revenueByMonth: [],
-    activity: [],
-  });
+  const terminals = loadJSON(TERMINALS_FILE);
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const online = terminals.filter(t => t.status === 'online').length;
+  const offline = terminals.filter(t => t.status === 'offline').length;
+  const provisioning = terminals.filter(t => t.status === 'provisioning').length;
+  const activeSubs = subscribers.filter(s => s.status === 'active');
+  const monthlyRevenue = activeSubs.reduce((sum, s) => sum + (s.monthlySpend || 0), 0);
+  const arpu = activeSubs.length > 0 ? Math.round(monthlyRevenue / activeSubs.length) : 0;
+  res.json({ totalTerminals: terminals.length, online, offline, provisioning,
+    activeSubscribers: activeSubs.length, monthlyRevenue,
+    prevMonthlyRevenue: Math.round(monthlyRevenue * 0.95),
+    arpu, revenueByMonth: [], activity: [] });
 });
 
 
 // ── Revenue ──────────────────────────────────────────────────────────────────
 app.get('/api/revenue', (req, res) => {
-  // Return empty months scaffold — will populate when subscribers are added
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const activeSubs = subscribers.filter(s => s.status === 'active');
+  const monthlyRevenue = activeSubs.reduce((sum, s) => sum + (s.monthlySpend || 0), 0);
+  const ispShare = Math.round(monthlyRevenue * 0.3 * 100) / 100;
   const months = [];
   const now = new Date();
   for (let i = 5; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     months.push({
       month: d.toLocaleString('en-US', { month: 'short', year: 'numeric' }),
-      totalRevenue: 0,
-      ispShare: 0,
-      subscriberCount: 0,
+      totalRevenue: i === 0 ? monthlyRevenue : 0,
+      ispShare: i === 0 ? ispShare : 0,
+      agentRevenue: 0,
+      subscriberCount: i === 0 ? activeSubs.length : 0,
     });
   }
   res.json(months);
