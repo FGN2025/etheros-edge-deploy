@@ -1177,15 +1177,21 @@ app.get('/api/agents/browse', (req, res) => {
 // Public (no auth needed) — used to brand the PIN screen before login
 app.get('/api/terminal/config', (req, res) => {
   const s = loadSettings();
+  // blacknutGamingPlans: array of plan slugs that have gaming access
+  // defaults to ['professional','charter'] if not set
+  const gamingPlans = Array.isArray(s.blacknutGamingPlans)
+    ? s.blacknutGamingPlans
+    : ['professional', 'charter'];
   res.json({
-    ispName:       s.ispName      || 'EtherOS',
-    accentColor:   s.accentColor  || '#00C2CB',
-    logoUrl:       s.logoUrl      || null,
-    welcomeTitle:  s.terminalWelcomeTitle  || null,
-    welcomeBody:   s.terminalWelcomeBody   || null,
-    supportPhone:  s.supportPhone  || null,
-    supportEmail:  s.supportEmail  || null,
-    blacknutEnabled: !!s.blacknutEnabled,
+    ispName:            s.ispName      || 'EtherOS',
+    accentColor:        s.accentColor  || '#00C2CB',
+    logoUrl:            s.logoUrl      || null,
+    welcomeTitle:       s.terminalWelcomeTitle  || null,
+    welcomeBody:        s.terminalWelcomeBody   || null,
+    supportPhone:       s.supportPhone  || null,
+    supportEmail:       s.supportEmail  || null,
+    blacknutEnabled:    !!s.blacknutEnabled,
+    blacknutGamingPlans: gamingPlans,
   });
 });
 
@@ -1539,36 +1545,69 @@ app.get('/api/subscribers/me', (req, res) => {
 
 // ── Cloud Services — Blacknut ─────────────────────────────────────────────────
 //
-// When API keys arrive from Blacknut, set them in Settings:
-//   blacknutApiKey, blacknutPartnerId, blacknutApiUrl (optional, defaults below)
+// Settings fields (stored in isp-settings.json):
+//   blacknutEnabled       — bool: show gaming tile to subscribers
+//   blacknutApiKey        — string: Bearer token for Blacknut REST API
+//   blacknutPartnerId     — string: Blacknut partner/ISP identifier
+//   blacknutApiUrl        — string (optional): override default API base
+//   blacknutGamingPlans   — string[]: which subscriber plans get gaming access
+//                           defaults to ['professional','charter']
 //
-// Blacknut session flow:
-//   1. Terminal POSTs subscriber token → /api/subscribers/:id/services/blacknut/session
-//   2. Backend calls Blacknut REST API to create a time-limited session
-//   3. Returns { launchUrl, expiresAt } — terminal opens launchUrl in Chromium
-//
-// Until real API keys are available, the endpoint returns a STUB response so
-// the frontend can be built and tested end-to-end.
+// Session flow:
+//   1. Terminal POST /api/subscribers/:id/services/blacknut/session
+//   2. Backend checks: enabled + plan entitlement + not suspended
+//   3. STUB: returns { stub:true, launchUrl:'https://www.blacknut.com/en', expiresAt }
+//   4. LIVE: calls Blacknut API, returns { stub:false, sessionId, launchUrl, expiresAt }
+//   5. Terminal opens launchUrl in new tab; polls session status if needed
 
 const BLACKNUT_DEFAULT_API = 'https://api.blacknut.com';
 
+// Helper — check if a plan has gaming access
+function planHasGaming(settings, plan) {
+  const gamingPlans = Array.isArray(settings.blacknutGamingPlans)
+    ? settings.blacknutGamingPlans
+    : ['professional', 'charter'];
+  return gamingPlans.includes(plan);
+}
+
+// POST /api/subscribers/:id/services/blacknut/session
+// Creates (or stubs) a Blacknut gaming session for the subscriber.
 app.post('/api/subscribers/:id/services/blacknut/session', async (req, res) => {
   const settings = loadSettings();
 
-  // Validate subscriber exists + is active
+  // 1. Blacknut must be enabled at the ISP level
+  if (!settings.blacknutEnabled) {
+    return res.status(403).json({ error: 'Gaming is not enabled for this ISP' });
+  }
+
+  // 2. Validate subscriber exists + is active
   const subscribers = loadJSON(SUBSCRIBERS_FILE);
   const sub = subscribers.find(s => s.id === req.params.id);
   if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
   if (sub.status === 'suspended') return res.status(403).json({ error: 'Account suspended' });
 
+  // 3. Plan entitlement check
+  if (!planHasGaming(settings, sub.plan)) {
+    return res.status(403).json({
+      error: 'Gaming not included in your plan',
+      plan: sub.plan,
+      requiredPlans: Array.isArray(settings.blacknutGamingPlans)
+        ? settings.blacknutGamingPlans
+        : ['professional', 'charter'],
+    });
+  }
+
   // ── STUB MODE (no API keys yet) ──────────────────────────────────────────
   if (!settings.blacknutApiKey || !settings.blacknutPartnerId) {
+    const expiresAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
     return res.json({
       ok: true,
       stub: true,
+      sessionId: 'stub-' + Date.now(),
       launchUrl: 'https://www.blacknut.com/en',
-      expiresAt: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
-      message: 'Blacknut API keys not yet configured — returning stub URL',
+      expiresAt,
+      plan: sub.plan,
+      message: 'Blacknut API keys not yet configured — returning stub session',
     });
   }
 
@@ -1583,11 +1622,11 @@ app.post('/api/subscribers/:id/services/blacknut/session', async (req, res) => {
         'Authorization': `Bearer ${settings.blacknutApiKey}`,
       },
       body: JSON.stringify({
-        partnerId: settings.blacknutPartnerId,
+        partnerId:      settings.blacknutPartnerId,
         externalUserId: sub.id,
-        plan: sub.plan,
-        userEmail: sub.email,
-        displayName: sub.name,
+        plan:           sub.plan,
+        userEmail:      sub.email,
+        displayName:    sub.name,
       }),
     });
 
@@ -1597,30 +1636,67 @@ app.post('/api/subscribers/:id/services/blacknut/session', async (req, res) => {
     }
 
     const data = await response.json();
-    res.json({
-      ok: true,
-      stub: false,
-      launchUrl: data.launchUrl || data.url || data.sessionUrl,
-      expiresAt: data.expiresAt || data.expires_at,
-    });
+    const sessionId = data.sessionId || data.id || data.session_id || null;
+    const launchUrl = data.launchUrl || data.url || data.sessionUrl;
+    const expiresAt = data.expiresAt || data.expires_at || null;
+
+    res.json({ ok: true, stub: false, sessionId, launchUrl, expiresAt, plan: sub.plan });
   } catch (err) {
     res.status(502).json({ error: 'Failed to reach Blacknut API', detail: String(err) });
   }
 });
 
-// GET /api/services/blacknut/status — check if Blacknut is configured + reachable
+// GET /api/subscribers/:id/services/blacknut/session/:sessionId
+// Poll a live session's status (stub always returns 'active').
+app.get('/api/subscribers/:id/services/blacknut/session/:sessionId', async (req, res) => {
+  const settings = loadSettings();
+  const { sessionId } = req.params;
+
+  // Stub session
+  if (!settings.blacknutApiKey || !settings.blacknutPartnerId || sessionId.startsWith('stub-')) {
+    return res.json({ sessionId, status: 'active', stub: true });
+  }
+
+  try {
+    const apiBase = (settings.blacknutApiUrl || BLACKNUT_DEFAULT_API).replace(/\/$/, '');
+    const r = await fetch(`${apiBase}/v1/sessions/${sessionId}`, {
+      headers: {
+        'X-Partner-Id': settings.blacknutPartnerId,
+        'Authorization': `Bearer ${settings.blacknutApiKey}`,
+      },
+    });
+    if (!r.ok) return res.status(r.status).json({ error: 'Session not found or expired' });
+    const data = await r.json();
+    res.json({ sessionId, status: data.status || 'active', expiresAt: data.expiresAt || data.expires_at, stub: false });
+  } catch (err) {
+    res.status(502).json({ error: 'Failed to reach Blacknut API', detail: String(err) });
+  }
+});
+
+// GET /api/services/blacknut/status — admin: check if Blacknut is configured + reachable
 app.get('/api/services/blacknut/status', async (req, res) => {
   const settings = loadSettings();
   if (!settings.blacknutEnabled) return res.json({ enabled: false, configured: false });
   if (!settings.blacknutApiKey || !settings.blacknutPartnerId) {
-    return res.json({ enabled: true, configured: false, message: 'API keys not set' });
+    return res.json({
+      enabled: true,
+      configured: false,
+      message: 'API keys not set — running in stub mode',
+      gamingPlans: Array.isArray(settings.blacknutGamingPlans) ? settings.blacknutGamingPlans : ['professional','charter'],
+    });
   }
   try {
     const apiBase = (settings.blacknutApiUrl || BLACKNUT_DEFAULT_API).replace(/\/$/, '');
     const r = await fetch(`${apiBase}/v1/partner/${settings.blacknutPartnerId}/status`, {
       headers: { 'Authorization': `Bearer ${settings.blacknutApiKey}` },
     });
-    res.json({ enabled: true, configured: true, reachable: r.ok, httpStatus: r.status });
+    res.json({
+      enabled: true,
+      configured: true,
+      reachable: r.ok,
+      httpStatus: r.status,
+      gamingPlans: Array.isArray(settings.blacknutGamingPlans) ? settings.blacknutGamingPlans : ['professional','charter'],
+    });
   } catch (err) {
     res.json({ enabled: true, configured: true, reachable: false, error: String(err) });
   }
