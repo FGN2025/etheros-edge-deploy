@@ -18,8 +18,8 @@ echo "  ✓ Backup saved"
 
 # ── Step 2: Pull new config ─────────────────────────────────
 echo "[2/4] Pulling updated nginx config..."
-curl -fsSL "$REPO/nginx/conf.d/etheros.conf" -o "$NGINX_CONF"
-echo "  ✓ etheros.conf updated"
+curl -fsSL "$REPO/nginx/conf.d/etheros-edge.conf" -o "$NGINX_CONF"
+echo "  ✓ etheros-edge.conf updated"
 
 # ── Step 3: Test nginx config ───────────────────────────────
 echo "[3/4] Testing nginx config..."
