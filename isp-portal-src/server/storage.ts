@@ -17,6 +17,7 @@ export interface IStorage {
   createAgent(agent: InsertAgent): Promise<Agent>;
   toggleAgent(id: string, enabled: boolean): Promise<Agent | undefined>;
   getRevenue(): Promise<RevenueMonth[]>;
+  recordRevenueSnapshot(snap: RevenueMonth): Promise<RevenueMonth>;
   getActivity(): Promise<ActivityEvent[]>;
   getSettings(): Promise<ISPSettings>;
   updateSettings(settings: Partial<ISPSettings>): Promise<ISPSettings>;
@@ -230,6 +231,12 @@ export class MemStorage implements IStorage {
   }
 
   async getRevenue() { return this.revenue; }
+  async recordRevenueSnapshot(snap: RevenueMonth): Promise<RevenueMonth> {
+    // Replace existing entry for same month, or append
+    const idx = this.revenue.findIndex(r => r.month === snap.month);
+    if (idx >= 0) { this.revenue[idx] = snap; } else { this.revenue.push(snap); }
+    return snap;
+  }
   async getActivity() { return this.activity; }
   async getSettings() { return this.settings; }
 

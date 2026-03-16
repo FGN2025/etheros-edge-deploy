@@ -163,6 +163,29 @@ export async function registerRoutes(
     res.json(revenue);
   });
 
+  // Revenue snapshot — POST to record current month's real figures
+  app.post("/api/revenue/snapshot", async (_req, res) => {
+    const subscribers = await storage.getSubscribers();
+    const activeSubscribers = subscribers.filter(s => s.status === 'active');
+    const totalRevenue = Math.round(activeSubscribers.reduce((sum, s) => sum + s.monthlySpend, 0));
+    const agentRevenue = Math.round(activeSubscribers.reduce((sum, s) => sum + (s.agentsActive * 4.99), 0));
+    const ispShare = Math.round(totalRevenue * 0.3);
+
+    const now = new Date();
+    const month = now.toLocaleString('en-US', { month: 'short', year: 'numeric', timeZone: 'America/Phoenix' });
+
+    const snap: import("@shared/schema").RevenueMonth = {
+      month,
+      totalRevenue,
+      ispShare,
+      agentRevenue,
+      subscriberCount: activeSubscribers.length,
+    };
+
+    const saved = await storage.recordRevenueSnapshot(snap);
+    res.json(saved);
+  });
+
   // Activity
   app.get("/api/activity", async (_req, res) => {
     const activity = await storage.getActivity();
