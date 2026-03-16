@@ -373,6 +373,7 @@ const PORT = process.env.PORT || 3010;
 // ── JSON file storage helpers ─────────────────────────────────────────────────
 const TERMINALS_FILE   = '/app/data/terminals.json';
 const SUBSCRIBERS_FILE = '/app/data/subscribers.json';
+const REVENUE_FILE     = '/app/data/revenue-history.json';
 
 function loadJSON(file, fallback = []) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -381,6 +382,25 @@ function loadJSON(file, fallback = []) {
 function saveJSON(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+// ── Revenue history (persistent) ────────────────────────────────────────────
+function loadRevenue() {
+  if (fs.existsSync(REVENUE_FILE)) {
+    try { return JSON.parse(fs.readFileSync(REVENUE_FILE, 'utf8')); } catch(e) {}
+  }
+  // Seed with zero-scaffold for last 6 months if no file yet
+  const months = [];
+  const now = new Date();
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    months.push({ month: d.toLocaleString('en-US',{month:'short',year:'numeric'}),
+      totalRevenue:0, ispShare:0, agentRevenue:0, subscriberCount:0, seeded:true });
+  }
+  return months;
+}
+function saveRevenue(history) {
+  fs.mkdirSync(path.dirname(REVENUE_FILE), { recursive: true });
+  fs.writeFileSync(REVENUE_FILE, JSON.stringify(history, null, 2));
 }
 
 // ── Terminals ────────────────────────────────────────────────────────────────
@@ -483,25 +503,27 @@ app.get('/api/dashboard', (req, res) => {
 
 // ── Revenue ──────────────────────────────────────────────────────────────────
 app.get('/api/revenue', (req, res) => {
-  const subscribers = loadJSON(SUBSCRIBERS_FILE);
-  const activeSubs = subscribers.filter(s => s.status === 'active');
-  const monthlyRevenue = activeSubs.reduce((sum, s) => sum + (s.monthlySpend || 0), 0);
-  const ispShare = Math.round(monthlyRevenue * 0.3 * 100) / 100;
-  const months = [];
-  const now = new Date();
-  for (let i = 5; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    months.push({
-      month: d.toLocaleString('en-US', { month: 'short', year: 'numeric' }),
-      totalRevenue: i === 0 ? monthlyRevenue : 0,
-      ispShare: i === 0 ? ispShare : 0,
-      agentRevenue: 0,
-      subscriberCount: i === 0 ? activeSubs.length : 0,
-    });
-  }
-  res.json(months);
+  res.json(loadRevenue());
 });
 
+
+
+// ── Revenue snapshot ─────────────────────────────────────────────────────────
+app.post('/api/revenue/snapshot', (req, res) => {
+  const subs = loadJSON(SUBSCRIBERS_FILE);
+  const active = subs.filter(s => s.status === 'active');
+  const totalRevenue = Math.round(active.reduce((s,sub) => s + (sub.monthlySpend||0), 0));
+  const agentRevenue = Math.round(active.reduce((s,sub) => s + ((sub.agentsActive||0)*4.99), 0));
+  const ispShare     = Math.round(totalRevenue * 0.3);
+  const month = new Date().toLocaleString('en-US',{month:'short',year:'numeric',timeZone:'America/Phoenix'});
+  const snap = { month, totalRevenue, ispShare, agentRevenue, subscriberCount: active.length };
+  const history = loadRevenue();
+  const idx = history.findIndex(r => r.month === month);
+  if (idx >= 0) history[idx] = snap; else history.push(snap);
+  history.sort((a,b) => new Date('1 '+a.month) - new Date('1 '+b.month));
+  saveRevenue(history.slice(-24));
+  res.json(snap);
+});
 
 // ── Terminal self-registration & heartbeat ────────────────────────────────────
 
