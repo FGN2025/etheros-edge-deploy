@@ -731,6 +731,77 @@ app.get('/api/isp-config', (req, res) => {
   }
 });
 
+// ── POST /api/chat/stream ────────────────────────────────────────────────────
+// Subscriber terminal inline chat — streams Ollama responses as SSE.
+// Validates the subscriber token, then proxies to Ollama /api/chat.
+app.post('/api/chat/stream', async (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const subscriberId = parseToken(token);
+  if (!subscriberId) return res.status(401).json({ error: 'Invalid or expired session' });
+
+  const { model, systemPrompt, messages } = req.body || {};
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'messages array required' });
+  }
+
+  const ollamaMessages = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+    ...messages,
+  ];
+
+  const ollamaUrl = 'http://etheros-ollama:11434/api/chat';
+  const ollamaModel = model || 'llama3.1:8b';
+
+  try {
+    const upstream = await fetch(ollamaUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: ollamaModel, messages: ollamaMessages, stream: true }),
+    });
+
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'Ollama unavailable', status: upstream.status });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const parsed = JSON.parse(line);
+          const delta = parsed.message?.content || '';
+          if (delta) {
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: delta } }] })}\n\n`);
+          }
+          if (parsed.done) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return;
+          }
+        } catch {}
+      }
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error('[chat/stream] error:', err.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Upstream error' });
+    else res.end();
+  }
+});
+
 // ── Health ────────────────────────────────────────────────────────────────────
 // GET /api/tenant — lightweight branding info for the frontend shell
 app.get('/api/tenant', (req, res) => {
@@ -1065,6 +1136,57 @@ app.get('/api/agents', (req, res) => {
     activationCount: subscribers.filter(s => (s.activeAgentIds || []).includes(a.id)).length,
   }));
   res.json(enriched);
+});
+
+// GET /api/agents/browse — subscriber-facing: lists ISP-enabled agents with subscriber's activation status
+// Called by the terminal after PIN auth. Token header: Authorization: Bearer <token>
+app.get('/api/agents/browse', (req, res) => {
+  // Parse subscriber from token
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const subscriberId = parseToken(token);
+  if (!subscriberId) return res.status(401).json({ error: 'Invalid or expired session' });
+
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const sub = subscribers.find(s => s.id === subscriberId);
+  if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
+
+  const agents = loadAgents();
+  const activeIds = sub.activeAgentIds || [];
+  const limit = PLAN_AGENT_LIMITS[sub.plan] || 3;
+
+  // Return all ISP-enabled agents with activation state for this subscriber
+  const browseable = agents
+    .filter(a => a.isEnabled && a.status === 'live')
+    .map(a => ({
+      ...a,
+      activated: activeIds.includes(a.id),
+    }));
+
+  res.json({
+    agents: browseable,
+    activeAgentIds: activeIds,
+    limit,
+    slotsUsed: activeIds.length,
+    slotsRemaining: Math.max(0, limit - activeIds.length),
+    plan: sub.plan,
+  });
+});
+
+// GET /api/terminal/config — ISP branding + terminal config for subscriber screens
+// Public (no auth needed) — used to brand the PIN screen before login
+app.get('/api/terminal/config', (req, res) => {
+  const s = loadSettings();
+  res.json({
+    ispName:       s.ispName      || 'EtherOS',
+    accentColor:   s.accentColor  || '#00C2CB',
+    logoUrl:       s.logoUrl      || null,
+    welcomeTitle:  s.terminalWelcomeTitle  || null,
+    welcomeBody:   s.terminalWelcomeBody   || null,
+    supportPhone:  s.supportPhone  || null,
+    supportEmail:  s.supportEmail  || null,
+    blacknutEnabled: !!s.blacknutEnabled,
+  });
 });
 
 // POST /api/agents — create a new agent
