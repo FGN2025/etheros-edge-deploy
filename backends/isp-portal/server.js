@@ -729,6 +729,53 @@ app.get('/api/settings/stripe-key-test', async (req, res) => {
   }
 });
 
+// ── Admin auth ───────────────────────────────────────────────────────────────
+// In-memory admin sessions: token → expiry timestamp
+const adminSessions = new Map();
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
+
+function generateAdminToken() {
+  return require('crypto').randomBytes(32).toString('hex');
+}
+
+// POST /api/admin/login  { password: string } → { token: string }
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body || {};
+  const s = loadSettings();
+  // If no adminPassword is set yet, accept "admin" as default and prompt setup
+  const expectedPassword = (s.adminPassword || '').trim() || 'admin';
+  if (!password || password !== expectedPassword) {
+    return res.status(401).json({ error: 'Invalid password' });
+  }
+  const token = generateAdminToken();
+  adminSessions.set(token, Date.now() + SESSION_TTL_MS);
+  res.json({ token, expiresIn: SESSION_TTL_MS });
+});
+
+// POST /api/admin/logout  { token: string }
+app.post('/api/admin/logout', (req, res) => {
+  const token = (req.headers['x-admin-token'] || req.body?.token || '').trim();
+  if (token) adminSessions.delete(token);
+  res.json({ ok: true });
+});
+
+// GET /api/admin/verify  — check if a session token is still valid
+app.get('/api/admin/verify', (req, res) => {
+  const token = (req.headers['x-admin-token'] || '').trim();
+  const s = loadSettings();
+  // Legacy: if settings.adminToken matches, accept it too
+  if (s.adminToken && token === s.adminToken) {
+    return res.json({ valid: true });
+  }
+  const expiry = adminSessions.get(token);
+  if (expiry && Date.now() < expiry) {
+    // Refresh TTL on activity
+    adminSessions.set(token, Date.now() + SESSION_TTL_MS);
+    return res.json({ valid: true });
+  }
+  res.status(401).json({ valid: false });
+});
+
 // ── Edge status ───────────────────────────────────────────────────────────────
 app.get('/api/edge-status', async (req, res) => {
   try {
