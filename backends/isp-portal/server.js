@@ -273,19 +273,218 @@ app.post('/api/billing/webhook', async (req, res) => {
           await syncSubscription(stripe, event.data.object.id);
         }
         break;
-      case 'checkout.session.completed':
+      case 'checkout.session.completed': {
         const sess = event.data.object;
         if (sess.subscription) {
           billingState.customerId = sess.customer;
-        saveBillingState(billingState);
           billingState.subscriptionId = sess.subscription;
+          saveBillingState(billingState);
           await syncSubscription(stripe, sess.subscription);
         }
+        // Auto-provision new ISP tenant if this is a sign-up checkout
+        if (sess.metadata && sess.metadata.provision_type === 'new_isp' && sess.metadata.isp_slug) {
+          const m = sess.metadata;
+          const slug = m.isp_slug.replace(/[^a-z0-9-]/g, '-');
+          const tenantDir = `/app/data/${slug}`;
+          const settingsFile = `${tenantDir}/isp-settings.json`;
+          const configFile = `/app/isp-config/${slug}.json`;
+          try {
+            fs.mkdirSync(tenantDir, { recursive: true });
+            fs.mkdirSync('/app/isp-config', { recursive: true });
+            if (!fs.existsSync(settingsFile)) {
+              fs.writeFileSync(settingsFile, JSON.stringify({
+                ispName: m.isp_name || slug,
+                domain: m.isp_domain || '',
+                accentColor: '#00C2CB',
+                logoUrl: '',
+                supportEmail: m.isp_email || `support@${m.isp_domain || slug + '.com'}`,
+                stripeKey: '', stripeWebhookSecret: '',
+              }, null, 2));
+            }
+            if (!fs.existsSync(configFile)) {
+              fs.writeFileSync(configFile, JSON.stringify({
+                slug, name: m.isp_name || slug,
+                domain: m.isp_domain || '',
+                logo_url: '', accent_color: '#00C2CB',
+                support_email: m.isp_email || '',
+                stripe_customer_id: sess.customer,
+                stripe_subscription_id: sess.subscription,
+                provisioned_at: new Date().toISOString(),
+              }, null, 2));
+            }
+            // Append to provisioning log
+            const logPath = '/app/data/provisioning-log.json';
+            let log = [];
+            try { log = JSON.parse(fs.readFileSync(logPath, 'utf8')); } catch {}
+            log.push({ slug, ispName: m.isp_name, domain: m.isp_domain, email: m.isp_email,
+              stripeCustomerId: sess.customer, provisionedAt: new Date().toISOString() });
+            fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
+            console.log(`[4B] Provisioned new ISP tenant: ${slug}`);
+          } catch (provErr) {
+            console.error('[4B] Auto-provision failed:', provErr);
+          }
+        }
         break;
+      }
     }
     res.json({ received: true });
   } catch (err) {
     console.error('Webhook handler error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── POST /api/billing/isp-signup ────────────────────────────────────────────
+// Creates a Stripe checkout session for a NEW ISP signing up.
+// Stores ISP metadata in Stripe session metadata so the webhook can provision.
+app.post('/api/billing/isp-signup', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured on this node.' });
+
+  const { planId, ispName, contactEmail, slug, domain, city, state, successUrl, cancelUrl } = req.body;
+  if (!planId || !ispName || !contactEmail || !slug) {
+    return res.status(400).json({ error: 'planId, ispName, contactEmail, and slug are required.' });
+  }
+
+  const plan = STRIPE_PLANS.find(p => p.id === planId);
+  if (!plan) return res.status(400).json({ error: 'Unknown plan' });
+
+  const settings = loadSettings();
+  const isTest   = settings.stripeKey?.startsWith('sk_test_');
+  const priceId  = isTest ? plan.stripePriceIdTest : plan.stripePriceId;
+
+  try {
+    // Create (or retrieve) a Stripe customer for this ISP
+    const customer = await stripe.customers.create({
+      email: contactEmail,
+      name: ispName,
+      metadata: { isp_slug: slug, isp_domain: domain || '', isp_city: city || '', isp_state: state || '' },
+    });
+
+    const base = successUrl || portalUrl('/isp-portal/#/signup/success');
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customer.id,
+      line_items: [{ price: priceId, quantity: 1 }],
+      subscription_data: {
+        trial_period_days: 14,
+        metadata: { isp_slug: slug, isp_name: ispName, isp_domain: domain || '' },
+      },
+      success_url: base + (base.includes('?') ? '&' : '?') + 'session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: cancelUrl || portalUrl('/isp-portal/#/signup'),
+      metadata: {
+        isp_slug: slug, isp_name: ispName, isp_domain: domain || '',
+        isp_email: contactEmail, isp_city: city || '', isp_state: state || '',
+        provision_type: 'new_isp',
+      },
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── POST /api/billing/provision-tenant ───────────────────────────────────────
+// Called by the success page after checkout to ensure tenant data exists.
+// Also called automatically by the Stripe webhook on checkout.session.completed.
+app.post('/api/billing/provision-tenant', async (req, res) => {
+  const { sessionId, slug: directSlug, ispName: directName, domain: directDomain, email: directEmail } = req.body || {};
+
+  let slug = directSlug, ispName = directName, domain = directDomain, email = directEmail;
+
+  // If sessionId provided, pull metadata from Stripe
+  if (sessionId) {
+    const stripe = getStripe();
+    if (stripe) {
+      try {
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        const m = session.metadata || {};
+        slug    = slug    || m.isp_slug;
+        ispName = ispName || m.isp_name;
+        domain  = domain  || m.isp_domain;
+        email   = email   || m.isp_email;
+      } catch {}
+    }
+  }
+
+  if (!slug) return res.status(400).json({ error: 'slug is required' });
+
+  slug = slug.replace(/[^a-z0-9-]/g, '-').replace(/(^-|-$)/g, '');
+  const tenantDataDir = `/app/data/${slug}`;
+  const settingsPath  = `${tenantDataDir}/isp-settings.json`;
+  const configPath    = `/app/isp-config/${slug}.json`;
+
+  try {
+    // 1. Create data directory
+    const fsMod = require('fs');
+    const pathMod = require('path');
+    fsMod.mkdirSync(tenantDataDir, { recursive: true });
+    fsMod.mkdirSync('/app/isp-config', { recursive: true });
+
+    // 2. Seed isp-settings.json if not present
+    if (!fsMod.existsSync(settingsPath)) {
+      fsMod.writeFileSync(settingsPath, JSON.stringify({
+        ispName: ispName || slug,
+        domain: domain || '',
+        accentColor: '#00C2CB',
+        logoUrl: '',
+        supportEmail: email || `support@${domain || slug + '.com'}`,
+        stripeKey: '',
+        stripeWebhookSecret: '',
+      }, null, 2));
+    }
+
+    // 3. Write tenant config JSON
+    if (!fsMod.existsSync(configPath)) {
+      fsMod.writeFileSync(configPath, JSON.stringify({
+        slug, name: ispName || slug,
+        domain: domain || '',
+        logo_url: '', accent_color: '#00C2CB',
+        support_email: email || `support@${domain || slug + '.com'}`,
+        provisioned_at: new Date().toISOString(),
+      }, null, 2));
+    }
+
+    // 4. Log provision event
+    const logPath = '/app/data/provisioning-log.json';
+    let log = [];
+    try { log = JSON.parse(fsMod.readFileSync(logPath, 'utf8')); } catch {}
+    log.push({ slug, ispName, domain, email, provisionedAt: new Date().toISOString() });
+    fsMod.writeFileSync(logPath, JSON.stringify(log, null, 2));
+
+    res.json({
+      ok: true,
+      slug,
+      ispName: ispName || slug,
+      domain: domain || '',
+      portalUrl: domain ? `https://${domain}/isp-portal/` : null,
+      dataDir: tenantDataDir,
+    });
+  } catch (err) {
+    console.error('Provision tenant error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── GET /api/billing/tenants ──────────────────────────────────────────────────
+// List all provisioned ISP tenants (for admin view)
+app.get('/api/billing/tenants', (req, res) => {
+  try {
+    const fsMod = require('fs');
+    const logPath = '/app/data/provisioning-log.json';
+    let log = [];
+    try { log = JSON.parse(fsMod.readFileSync(logPath, 'utf8')); } catch {}
+    // Also scan isp-config dir
+    const configDir = '/app/isp-config';
+    let configs = [];
+    if (fsMod.existsSync(configDir)) {
+      configs = fsMod.readdirSync(configDir)
+        .filter(f => f.endsWith('.json'))
+        .map(f => { try { return JSON.parse(fsMod.readFileSync(`${configDir}/${f}`, 'utf8')); } catch { return null; } })
+        .filter(Boolean);
+    }
+    res.json({ tenants: configs, provisioningLog: log });
+  } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
