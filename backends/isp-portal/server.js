@@ -676,7 +676,7 @@ app.get('/api/agents', (req, res) => {
 
 // POST /api/agents — create a new agent
 app.post('/api/agents', (req, res) => {
-  const { name, description, category, modelId, systemPrompt, pricingType, priceMonthly } = req.body;
+  const { name, description, category, modelId, systemPrompt, pricingType, priceMonthly, notebookSources } = req.body;
   if (!name || !description) return res.status(400).json({ error: 'name and description are required' });
   const agents = loadAgents();
   const agent = {
@@ -689,6 +689,7 @@ app.post('/api/agents', (req, res) => {
     modelId: modelId || 'llama3.1:8b',
     systemPrompt: systemPrompt || '',
     slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+    notebookSources: Array.isArray(notebookSources) ? notebookSources : [],
   };
   agents.push(agent);
   saveAgents(agents);
