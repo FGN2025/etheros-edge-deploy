@@ -10,10 +10,34 @@ app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cors({ origin: '*' }));
 
-const EDGE_API = 'https://edge.etheros.ai/api';
-const SETTINGS_FILE = '/app/data/isp-settings.json';
 const fs   = require('fs');
 const path = require('path');
+
+// ── Multi-tenancy: data isolation via TENANT_SLUG env var ─────────────────────
+// Each ISP gets its own data directory. On a fresh single-ISP deploy the env
+// var is not set and we fall back to /app/data (backward-compatible).
+// On a multi-tenant VPS each container is launched with:
+//   -e TENANT_SLUG=valley-fiber  → data lives at /app/data/valley-fiber/
+const TENANT_SLUG = (process.env.TENANT_SLUG || '').replace(/[^a-z0-9-]/g, '') || null;
+const DATA_DIR    = TENANT_SLUG
+  ? `/app/data/${TENANT_SLUG}`
+  : '/app/data';
+
+// Dynamic domain — read from settings or fall back to TENANT_DOMAIN env var
+// so Stripe redirect URLs are always correct for each ISP's domain.
+function getPortalDomain() {
+  try {
+    const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    if (s.domain) return s.domain.replace(/\/$/, '');
+  } catch {}
+  return (process.env.TENANT_DOMAIN || 'edge.etheros.ai').replace(/\/$/, '');
+}
+function portalUrl(path = '') {
+  return `https://${getPortalDomain()}${path}`;
+}
+
+const EDGE_API      = `https://${(process.env.TENANT_DOMAIN || 'edge.etheros.ai').replace(/\/$/, '')}/api`;
+const SETTINGS_FILE = `${DATA_DIR}/isp-settings.json`;
 
 // ── Settings helpers ──────────────────────────────────────────────────────────
 function loadSettings() {
@@ -36,7 +60,7 @@ function getStripe() {
 }
 
 // ── Billing state (in-memory, synced from Stripe) ────────────────────────────
-const BILLING_FILE = '/app/data/billing-state.json';
+const BILLING_FILE = `${DATA_DIR}/billing-state.json`;
 function loadBillingState() {
   try { return JSON.parse(fs.readFileSync(BILLING_FILE, 'utf8')); } catch { return {}; }
 }
@@ -156,10 +180,10 @@ app.post('/api/billing/checkout', async (req, res) => {
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: { trial_period_days: 14 },
       success_url: (() => {
-        const base = successUrl || 'https://edge.etheros.ai/isp-portal/#/billing?status=success';
+        const base = successUrl || portalUrl('/isp-portal/#/billing?status=success');
         return base + (base.includes('?') ? '&' : '?') + 'session_id={CHECKOUT_SESSION_ID}';
       })(),
-      cancel_url: cancelUrl || 'https://edge.etheros.ai/isp-portal/#/billing?status=canceled',
+      cancel_url: cancelUrl || portalUrl('/isp-portal/#/billing?status=canceled'),
     };
     if (billingState.customerId) params.customer = billingState.customerId;
     const session = await stripe.checkout.sessions.create(params);
@@ -215,7 +239,7 @@ app.post('/api/billing/portal', async (req, res) => {
   try {
     const session = await stripe.billingPortal.sessions.create({
       customer: billingState.customerId,
-      return_url: returnUrl || 'https://edge.etheros.ai/isp-portal/#/billing',
+      return_url: returnUrl || portalUrl('/isp-portal/#/billing'),
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -322,7 +346,7 @@ app.get('/api/edge-status', async (req, res) => {
     res.json({
       edgeOnline: !!health, health, models,
       ollamaOnline: models.length > 0, checkedAt: new Date().toISOString(),
-      edgeUrl: 'https://edge.etheros.ai',
+      edgeUrl: portalUrl(''),
     });
   } catch (err) {
     res.json({ edgeOnline: false, models: [], ollamaOnline: false, error: String(err), checkedAt: new Date().toISOString() });
@@ -360,20 +384,47 @@ app.get('/api/isp-config', (req, res) => {
     }).filter(Boolean);
     res.json(configs);
   } catch {
-    res.json([{ slug: 'etheros-default', name: 'EtherOS AI', domain: 'edge.etheros.ai', accent_color: '#00C2CB' }]);
+    const _s = loadSettings();
+    res.json([{ slug: TENANT_SLUG || 'etheros-default', name: _s.ispName || 'EtherOS AI', domain: _s.domain || getPortalDomain(), accent_color: _s.accentColor || '#00C2CB' }]);
   }
 });
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'isp-portal-backend', version: '1.2.0-stripe', ts: new Date().toISOString() }));
+// GET /api/tenant — lightweight branding info for the frontend shell
+app.get('/api/tenant', (req, res) => {
+  const s = loadSettings();
+  const name = s.ispName || 'EtherOS';
+  const initials = name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  res.json({
+    slug:        TENANT_SLUG || 'default',
+    name,
+    initials,
+    domain:      s.domain      || getPortalDomain(),
+    accentColor: s.accentColor || '#00C2CB',
+    logoUrl:     s.logoUrl     || null,
+  });
+});
+
+app.get('/health', (req, res) => {
+  const s = loadSettings();
+  res.json({
+    status: 'ok',
+    service: 'isp-portal-backend',
+    version: '2.0.0-multitenant',
+    tenant: TENANT_SLUG || 'default',
+    ispName: s.ispName || null,
+    domain: s.domain || getPortalDomain(),
+    ts: new Date().toISOString(),
+  });
+});
 
 const PORT = process.env.PORT || 3010;
 
 
 // ── JSON file storage helpers ─────────────────────────────────────────────────
-const TERMINALS_FILE   = '/app/data/terminals.json';
-const SUBSCRIBERS_FILE = '/app/data/subscribers.json';
-const REVENUE_FILE     = '/app/data/revenue-history.json';
+const TERMINALS_FILE   = `${DATA_DIR}/terminals.json`;
+const SUBSCRIBERS_FILE = `${DATA_DIR}/subscribers.json`;
+const REVENUE_FILE     = `${DATA_DIR}/revenue-history.json`;
 
 function loadJSON(file, fallback = []) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -513,8 +564,8 @@ app.post('/api/subscribers/billing/batch-invite', async (req, res) => {
         mode: 'subscription',
         line_items: [{ price: plan.priceId, quantity: 1 }],
         customer_email: sub.email,
-        success_url: successUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=success',
-        cancel_url: cancelUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=canceled',
+        success_url: successUrl || portalUrl('/isp-portal/#/subscribers?billing=success'),
+        cancel_url: cancelUrl || portalUrl('/isp-portal/#/subscribers?billing=canceled'),
         metadata: { subscriberId: sub.id, plan: sub.plan },
       };
       const session = await stripe.checkout.sessions.create(params);
@@ -554,8 +605,8 @@ app.post('/api/subscribers/:id/billing/checkout', async (req, res) => {
       mode: 'subscription',
       line_items: [{ price: plan.priceId, quantity: 1 }],
       customer_email: subscriber.stripeCustomerId ? undefined : subscriber.email,
-      success_url: successUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=success',
-      cancel_url: cancelUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=canceled',
+      success_url: successUrl || portalUrl('/isp-portal/#/subscribers?billing=success'),
+      cancel_url: cancelUrl || portalUrl('/isp-portal/#/subscribers?billing=canceled'),
       metadata: {
         subscriberId: subscriber.id,
         plan: subscriber.plan,
@@ -594,7 +645,7 @@ app.post('/api/subscribers/:id/billing/portal', async (req, res) => {
   try {
     const session = await stripe.billingPortal.sessions.create({
       customer: sub.stripeCustomerId,
-      return_url: returnUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers',
+      return_url: returnUrl || portalUrl('/isp-portal/#/subscribers'),
     });
     res.json({ portalUrl: session.url });
   } catch (err) {
@@ -628,7 +679,7 @@ app.get('/api/subscribers/:id/billing', async (req, res) => {
 
 // ── Agents ────────────────────────────────────────────────────────────────────
 
-const AGENTS_FILE = '/app/data/agents.json';
+const AGENTS_FILE = `${DATA_DIR}/agents.json`;
 
 const PLAN_AGENT_LIMITS = { personal: 3, professional: 10, charter: 999 };
 
