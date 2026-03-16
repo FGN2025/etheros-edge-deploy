@@ -341,7 +341,7 @@ app.post('/api/billing/isp-signup', async (req, res) => {
   const stripe = getStripe();
   if (!stripe) return res.status(400).json({ error: 'Stripe not configured on this node.' });
 
-  const { planId, ispName, contactEmail, slug, domain, city, state, successUrl, cancelUrl } = req.body;
+  const { planId, ispName, contactEmail, slug, domain, city, state, successUrl, cancelUrl, accentColor } = req.body;
   if (!planId || !ispName || !contactEmail || !slug) {
     return res.status(400).json({ error: 'planId, ispName, contactEmail, and slug are required.' });
   }
@@ -375,6 +375,7 @@ app.post('/api/billing/isp-signup', async (req, res) => {
       metadata: {
         isp_slug: slug, isp_name: ispName, isp_domain: domain || '',
         isp_email: contactEmail, isp_city: city || '', isp_state: state || '',
+        isp_accent: accentColor || '#00C2CB',
         provision_type: 'new_isp',
       },
     });
@@ -387,10 +388,11 @@ app.post('/api/billing/isp-signup', async (req, res) => {
 // ── POST /api/billing/provision-tenant ───────────────────────────────────────
 // Called by the success page after checkout to ensure tenant data exists.
 // Also called automatically by the Stripe webhook on checkout.session.completed.
+// Sprint 4C: also spins up isolated Docker container + nginx vhost.
 app.post('/api/billing/provision-tenant', async (req, res) => {
-  const { sessionId, slug: directSlug, ispName: directName, domain: directDomain, email: directEmail } = req.body || {};
+  const { sessionId, slug: directSlug, ispName: directName, domain: directDomain, email: directEmail, accentColor: directAccent } = req.body || {};
 
-  let slug = directSlug, ispName = directName, domain = directDomain, email = directEmail;
+  let slug = directSlug, ispName = directName, domain = directDomain, email = directEmail, accentColor = directAccent || '#00C2CB';
 
   // If sessionId provided, pull metadata from Stripe
   if (sessionId) {
@@ -399,10 +401,11 @@ app.post('/api/billing/provision-tenant', async (req, res) => {
       try {
         const session = await stripe.checkout.sessions.retrieve(sessionId);
         const m = session.metadata || {};
-        slug    = slug    || m.isp_slug;
-        ispName = ispName || m.isp_name;
-        domain  = domain  || m.isp_domain;
-        email   = email   || m.isp_email;
+        slug        = slug        || m.isp_slug;
+        ispName     = ispName     || m.isp_name;
+        domain      = domain      || m.isp_domain;
+        email       = email       || m.isp_email;
+        accentColor = accentColor || m.isp_accent || '#00C2CB';
       } catch {}
     }
   }
@@ -413,77 +416,217 @@ app.post('/api/billing/provision-tenant', async (req, res) => {
   const tenantDataDir = `/app/data/${slug}`;
   const settingsPath  = `${tenantDataDir}/isp-settings.json`;
   const configPath    = `/app/isp-config/${slug}.json`;
+  const containerName = `etheros-isp-${slug}`;
+  const steps = [];
 
   try {
-    // 1. Create data directory
     const fsMod = require('fs');
-    const pathMod = require('path');
+    const { execSync } = require('child_process');
+
+    // 1. Create data directory
     fsMod.mkdirSync(tenantDataDir, { recursive: true });
     fsMod.mkdirSync('/app/isp-config', { recursive: true });
+    steps.push('data_dir');
 
     // 2. Seed isp-settings.json if not present
     if (!fsMod.existsSync(settingsPath)) {
       fsMod.writeFileSync(settingsPath, JSON.stringify({
         ispName: ispName || slug,
         domain: domain || '',
-        accentColor: '#00C2CB',
+        accentColor,
         logoUrl: '',
         supportEmail: email || `support@${domain || slug + '.com'}`,
         stripeKey: '',
         stripeWebhookSecret: '',
       }, null, 2));
     }
+    steps.push('settings');
 
     // 3. Write tenant config JSON
     if (!fsMod.existsSync(configPath)) {
       fsMod.writeFileSync(configPath, JSON.stringify({
-        slug, name: ispName || slug,
+        slug,
+        name: ispName || slug,
         domain: domain || '',
-        logo_url: '', accent_color: '#00C2CB',
+        logo_url: '',
+        accent_color: accentColor,
         support_email: email || `support@${domain || slug + '.com'}`,
         provisioned_at: new Date().toISOString(),
       }, null, 2));
     }
+    steps.push('config');
 
     // 4. Log provision event
     const logPath = '/app/data/provisioning-log.json';
     let log = [];
     try { log = JSON.parse(fsMod.readFileSync(logPath, 'utf8')); } catch {}
-    log.push({ slug, ispName, domain, email, provisionedAt: new Date().toISOString() });
-    fsMod.writeFileSync(logPath, JSON.stringify(log, null, 2));
+    const alreadyLogged = log.some(e => e.slug === slug);
+    if (!alreadyLogged) {
+      log.push({ slug, ispName, domain, email, accentColor, provisionedAt: new Date().toISOString() });
+      fsMod.writeFileSync(logPath, JSON.stringify(log, null, 2));
+    }
+    steps.push('log');
+
+    // 5. Spin up isolated Docker container (idempotent — skip if already running)
+    let containerStatus = 'skipped';
+    try {
+      const running = execSync(
+        `docker ps --filter name=^${containerName}$ --format '{{.Status}}'`,
+        { encoding: 'utf8' }
+      ).trim();
+
+      if (!running) {
+        // Auto-assign next free port in 3020-3099
+        let port = 3020;
+        const usedPorts = execSync(
+          `docker ps --format '{{.Ports}}' 2>/dev/null || true`,
+          { encoding: 'utf8' }
+        );
+        while (usedPorts.includes(`127.0.0.1:${port}->`) && port < 3100) port++;
+
+        execSync([
+          'docker run -d',
+          `--name ${containerName}`,
+          '--network etheros-edge_edge-internal',
+          '--restart unless-stopped',
+          `-p 127.0.0.1:${port}:3010`,
+          '-v /opt/etheros-edge/backends/isp-portal:/app:rw',
+          `-e TENANT_SLUG=${slug}`,
+          `-e TENANT_DOMAIN=${domain || 'edge.etheros.ai'}`,
+          '-e NODE_ENV=production',
+          `--label etheros.tenant=${slug}`,
+          `--label etheros.domain=${domain || ''}`,
+          'etheros-edge_etheros-isp-portal-backend',
+        ].join(' '), { encoding: 'utf8' });
+
+        // Update config with assigned port
+        try {
+          const cfg = JSON.parse(fsMod.readFileSync(configPath, 'utf8'));
+          cfg.backend_port = port;
+          fsMod.writeFileSync(configPath, JSON.stringify(cfg, null, 2));
+        } catch {}
+
+        containerStatus = `started:${port}`;
+        steps.push(`container:${port}`);
+      } else {
+        containerStatus = `already_running`;
+        steps.push('container:already_running');
+      }
+    } catch (dockerErr) {
+      console.error('[4C] Docker container spawn failed:', dockerErr.message);
+      containerStatus = `error:${dockerErr.message}`;
+      steps.push('container:error');
+    }
+
+    // 6. Generate nginx vhost and reload (only if domain is set)
+    let nginxStatus = 'skipped';
+    if (domain) {
+      try {
+        const nginxConfDir  = '/opt/etheros-edge/nginx/conf.d';
+        const templatePath  = '/opt/etheros-edge/nginx/tenant-vhost.conf.template';
+        const vhostPath     = `${nginxConfDir}/${slug}.conf`;
+
+        if (!fsMod.existsSync(vhostPath) && fsMod.existsSync(templatePath)) {
+          const cfg      = JSON.parse(fsMod.readFileSync(configPath, 'utf8'));
+          const port     = cfg.backend_port || 3020;
+          const template = fsMod.readFileSync(templatePath, 'utf8');
+          const vhost    = template
+            .replace(/__DOMAIN__/g, domain)
+            .replace(/__SLUG__/g, slug)
+            .replace(/__ISP_NAME__/g, ispName || slug)
+            .replace(/__ACCENT_COLOR__/g, accentColor)
+            .replace(/__PORT__/g, String(port));
+          fsMod.mkdirSync(nginxConfDir, { recursive: true });
+          fsMod.writeFileSync(vhostPath, vhost);
+
+          // Reload nginx
+          execSync('docker exec etheros-nginx nginx -s reload', { encoding: 'utf8' });
+          nginxStatus = 'reloaded';
+          steps.push('nginx:reloaded');
+        } else if (fsMod.existsSync(vhostPath)) {
+          nginxStatus = 'already_exists';
+          steps.push('nginx:already_exists');
+        } else {
+          nginxStatus = 'template_not_found';
+          steps.push('nginx:template_not_found');
+        }
+      } catch (nginxErr) {
+        console.error('[4C] Nginx vhost generation failed:', nginxErr.message);
+        nginxStatus = `error:${nginxErr.message}`;
+        steps.push('nginx:error');
+      }
+    }
 
     res.json({
       ok: true,
       slug,
       ispName: ispName || slug,
       domain: domain || '',
-      portalUrl: domain ? `https://${domain}/isp-portal/` : null,
+      portalUrl: domain ? `https://${domain}/isp-portal/` : `https://edge.etheros.ai/isp-portal/`,
       dataDir: tenantDataDir,
+      containerStatus,
+      nginxStatus,
+      steps,
     });
   } catch (err) {
     console.error('Provision tenant error:', err);
-    res.status(500).json({ error: String(err) });
+    res.status(500).json({ error: String(err), steps });
   }
 });
 
 // ── GET /api/billing/tenants ──────────────────────────────────────────────────
-// List all provisioned ISP tenants (for admin view)
+// List all provisioned ISP tenants with live Docker container status.
 app.get('/api/billing/tenants', (req, res) => {
   try {
     const fsMod = require('fs');
+    const { execSync } = require('child_process');
+
+    // Read provisioning log
     const logPath = '/app/data/provisioning-log.json';
     let log = [];
     try { log = JSON.parse(fsMod.readFileSync(logPath, 'utf8')); } catch {}
-    // Also scan isp-config dir
+
+    // Scan isp-config dir for canonical tenant list
     const configDir = '/app/isp-config';
     let configs = [];
     if (fsMod.existsSync(configDir)) {
       configs = fsMod.readdirSync(configDir)
         .filter(f => f.endsWith('.json'))
-        .map(f => { try { return JSON.parse(fsMod.readFileSync(`${configDir}/${f}`, 'utf8')); } catch { return null; } })
+        .map(f => {
+          try { return JSON.parse(fsMod.readFileSync(`${configDir}/${f}`, 'utf8')); }
+          catch { return null; }
+        })
         .filter(Boolean);
     }
-    res.json({ tenants: configs, provisioningLog: log });
+
+    // Get live Docker status for each tenant container
+    let dockerStatus = {};
+    try {
+      const lines = execSync(
+        `docker ps -a --filter label=etheros.tenant --format '{{.Names}}\t{{.Status}}'`,
+        { encoding: 'utf8' }
+      ).trim().split('\n').filter(Boolean);
+      for (const line of lines) {
+        const [name, ...rest] = line.split('\t');
+        const slug = name.replace('etheros-isp-', '');
+        dockerStatus[slug] = rest.join('\t');
+      }
+    } catch {}
+
+    // Merge container status into configs
+    const enriched = configs.map(c => ({
+      ...c,
+      container: {
+        name: `etheros-isp-${c.slug}`,
+        status: dockerStatus[c.slug] || 'not_started',
+        healthy: (dockerStatus[c.slug] || '').toLowerCase().startsWith('up'),
+      },
+      portalUrl: c.domain
+        ? `https://${c.domain}/isp-portal/`
+        : `https://edge.etheros.ai/isp-portal/`,
+    }));
+
+    res.json({ tenants: enriched, provisioningLog: log });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
