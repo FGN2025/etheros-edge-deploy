@@ -626,6 +626,162 @@ app.get('/api/subscribers/:id/billing', async (req, res) => {
   res.json(sub);
 });
 
+// ── Agents ────────────────────────────────────────────────────────────────────
+
+const AGENTS_FILE = '/app/data/agents.json';
+
+const PLAN_AGENT_LIMITS = { personal: 3, professional: 10, charter: 999 };
+
+const DEFAULT_AGENTS = [
+  { id: 'agent-001', name: 'Rural Support Assistant', slug: 'rural-support', description: 'Answers common rural broadband questions, outage updates, and billing FAQs for end users.', category: 'Support', creatorRole: 'etheros', status: 'live', pricingType: 'free', priceMonthly: 0, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are a helpful rural ISP support assistant. Answer questions about internet service, outages, billing, and equipment in a friendly and simple way.' },
+  { id: 'agent-002', name: 'Community Bulletin', slug: 'community-bulletin', description: 'Shares local news, events, and community announcements tailored to the subscriber\'s area.', category: 'Community', creatorRole: 'etheros', status: 'live', pricingType: 'free', priceMonthly: 0, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are a friendly community assistant for a rural area. Share local news, events, weather, and community information.' },
+  { id: 'agent-003', name: 'HomeSchool Tutor', slug: 'homeschool-tutor', description: 'Patient K-12 tutoring assistant for homeschool families covering math, science, reading, and history.', category: 'Learning', creatorRole: 'etheros', status: 'live', pricingType: 'free', priceMonthly: 0, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are a patient, encouraging K-12 tutor. Help students with math, science, reading, writing, and history. Explain concepts simply and check for understanding.' },
+  { id: 'agent-004', name: 'Farm & Ranch Advisor', slug: 'farm-ranch-advisor', description: 'Agronomic and livestock guidance for small farms — planting schedules, soil health, pest management.', category: 'Agriculture', creatorRole: 'etheros', status: 'live', pricingType: 'free', priceMonthly: 0, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are an agricultural advisor for small farms and ranches. Provide practical guidance on crops, livestock, soil health, irrigation, and pest management.' },
+  { id: 'agent-005', name: 'Health Navigator', slug: 'health-navigator', description: 'General health information, symptom guidance, and telehealth navigation for rural households.', category: 'Health', creatorRole: 'etheros', status: 'live', pricingType: 'free', priceMonthly: 0, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are a general health information assistant. Provide helpful health information, help users understand symptoms, and guide them to appropriate care. Always recommend consulting a doctor for medical decisions.' },
+  { id: 'agent-006', name: 'Small Biz Coach', slug: 'small-biz-coach', description: 'Business planning, marketing, and operations advice for rural small business owners.', category: 'Business', creatorRole: 'etheros', status: 'live', pricingType: 'addon', priceMonthly: 4.99, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are a small business coach for rural entrepreneurs. Help with business planning, marketing strategies, financial basics, and operational challenges.' },
+  { id: 'agent-007', name: 'Legal Q&A', slug: 'legal-qa', description: 'Plain-language explanations of common legal questions — leases, contracts, employment, and property.', category: 'Business', creatorRole: 'etheros', status: 'live', pricingType: 'addon', priceMonthly: 4.99, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You provide plain-language explanations of common legal concepts. Always clarify you are not a lawyer and recommend consulting one for specific legal advice.' },
+  { id: 'agent-008', name: 'Dev Sandbox', slug: 'dev-sandbox', description: 'Code assistant for developers — debugging, snippets, and architecture guidance across popular languages.', category: 'Development', creatorRole: 'etheros', status: 'live', pricingType: 'addon', priceMonthly: 4.99, activationCount: 0, isEnabled: false, modelId: 'llama3.1:8b', systemPrompt: 'You are an expert software developer assistant. Help with code debugging, writing code snippets, explaining concepts, and software architecture across all major languages.' },
+  { id: 'agent-009', name: 'Data Analyst', slug: 'data-analyst', description: 'Helps interpret spreadsheets, charts, and business data — ideal for small business analytics.', category: 'Analytics', creatorRole: 'etheros', status: 'live', pricingType: 'addon', priceMonthly: 9.99, activationCount: 0, isEnabled: false, modelId: 'llama3.1:8b', systemPrompt: 'You are a data analysis assistant. Help users understand their data, create summaries, identify trends, and make data-driven decisions.' },
+  { id: 'agent-010', name: 'Creative Writer', slug: 'creative-writer', description: 'Storytelling, poetry, marketing copy, and creative writing assistance for individuals and businesses.', category: 'Creative', creatorRole: 'etheros', status: 'live', pricingType: 'free', priceMonthly: 0, activationCount: 0, isEnabled: true, modelId: 'llama3.1:8b', systemPrompt: 'You are a creative writing assistant. Help with stories, poems, marketing copy, blog posts, and any creative writing project.' },
+];
+
+function loadAgents() {
+  try {
+    const raw = fs.readFileSync(AGENTS_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    // Seed defaults on first load
+    fs.mkdirSync(path.dirname(AGENTS_FILE), { recursive: true });
+    fs.writeFileSync(AGENTS_FILE, JSON.stringify(DEFAULT_AGENTS, null, 2));
+    return DEFAULT_AGENTS;
+  }
+}
+
+function saveAgents(agents) {
+  fs.mkdirSync(path.dirname(AGENTS_FILE), { recursive: true });
+  fs.writeFileSync(AGENTS_FILE, JSON.stringify(agents, null, 2));
+}
+
+// GET /api/agents — list all agents
+app.get('/api/agents', (req, res) => {
+  const agents = loadAgents();
+  // Attach live activation count from subscribers
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const enriched = agents.map(a => ({
+    ...a,
+    activationCount: subscribers.filter(s => (s.activeAgentIds || []).includes(a.id)).length,
+  }));
+  res.json(enriched);
+});
+
+// POST /api/agents — create a new agent
+app.post('/api/agents', (req, res) => {
+  const { name, description, category, modelId, systemPrompt, pricingType, priceMonthly } = req.body;
+  if (!name || !description) return res.status(400).json({ error: 'name and description are required' });
+  const agents = loadAgents();
+  const agent = {
+    id: 'agent-' + require('crypto').randomUUID().slice(0, 8),
+    name, description, category: category || 'Productivity',
+    creatorRole: 'isp', status: 'live',
+    pricingType: pricingType || 'free',
+    priceMonthly: priceMonthly || 0,
+    activationCount: 0, isEnabled: true,
+    modelId: modelId || 'llama3.1:8b',
+    systemPrompt: systemPrompt || '',
+    slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+  };
+  agents.push(agent);
+  saveAgents(agents);
+  res.status(201).json(agent);
+});
+
+// PATCH /api/agents/:id/toggle — ISP-level enable/disable
+app.patch('/api/agents/:id/toggle', (req, res) => {
+  const agents = loadAgents();
+  const idx = agents.findIndex(a => a.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Agent not found' });
+  agents[idx].isEnabled = req.body.enabled ?? !agents[idx].isEnabled;
+  saveAgents(agents);
+  res.json(agents[idx]);
+});
+
+// PATCH /api/agents/:id — update agent fields
+app.patch('/api/agents/:id', (req, res) => {
+  const agents = loadAgents();
+  const idx = agents.findIndex(a => a.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Agent not found' });
+  agents[idx] = { ...agents[idx], ...req.body, id: agents[idx].id, creatorRole: agents[idx].creatorRole };
+  saveAgents(agents);
+  res.json(agents[idx]);
+});
+
+// DELETE /api/agents/:id — remove an ISP-created agent
+app.delete('/api/agents/:id', (req, res) => {
+  const agents = loadAgents();
+  const agent = agents.find(a => a.id === req.params.id);
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  if (agent.creatorRole !== 'isp') return res.status(403).json({ error: 'Cannot delete EtherOS agents' });
+  saveAgents(agents.filter(a => a.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+// GET /api/subscribers/:id/agents — list this subscriber's active agents
+app.get('/api/subscribers/:id/agents', (req, res) => {
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const sub = subscribers.find(s => s.id === req.params.id);
+  if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
+  const agents = loadAgents();
+  const activeIds = sub.activeAgentIds || [];
+  const active = agents.filter(a => activeIds.includes(a.id));
+  res.json({ activeAgentIds: activeIds, agents: active, limit: PLAN_AGENT_LIMITS[sub.plan] || 3 });
+});
+
+// POST /api/subscribers/:id/agents/:agentId — activate an agent for a subscriber
+app.post('/api/subscribers/:id/agents/:agentId', (req, res) => {
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const idx = subscribers.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Subscriber not found' });
+
+  const agents = loadAgents();
+  const agent = agents.find(a => a.id === req.params.agentId);
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  if (!agent.isEnabled) return res.status(403).json({ error: 'Agent is not enabled by ISP' });
+
+  const sub = subscribers[idx];
+  const limit = PLAN_AGENT_LIMITS[sub.plan] || 3;
+  const activeIds = sub.activeAgentIds || [];
+
+  if (activeIds.includes(req.params.agentId)) {
+    return res.status(409).json({ error: 'Agent already active for this subscriber' });
+  }
+  if (activeIds.length >= limit) {
+    return res.status(403).json({ error: `Plan limit reached (${limit} agents max on ${sub.plan} plan)` });
+  }
+
+  sub.activeAgentIds = [...activeIds, req.params.agentId];
+  sub.agentsActive = sub.activeAgentIds.length;
+  sub.agents = sub.activeAgentIds.map(id => agents.find(a => a.id === id)?.name || id);
+  subscribers[idx] = sub;
+  saveJSON(SUBSCRIBERS_FILE, subscribers);
+  res.json({ ok: true, subscriber: sub, activeAgentIds: sub.activeAgentIds });
+});
+
+// DELETE /api/subscribers/:id/agents/:agentId — deactivate an agent for a subscriber
+app.delete('/api/subscribers/:id/agents/:agentId', (req, res) => {
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const idx = subscribers.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Subscriber not found' });
+
+  const sub = subscribers[idx];
+  const agents = loadAgents();
+  sub.activeAgentIds = (sub.activeAgentIds || []).filter(id => id !== req.params.agentId);
+  sub.agentsActive = sub.activeAgentIds.length;
+  sub.agents = sub.activeAgentIds.map(id => agents.find(a => a.id === id)?.name || id);
+  subscribers[idx] = sub;
+  saveJSON(SUBSCRIBERS_FILE, subscribers);
+  res.json({ ok: true, subscriber: sub, activeAgentIds: sub.activeAgentIds });
+});
+
 // ── Dashboard KPIs ──────────────────────────────────────────────────────────
 app.get('/api/dashboard', (req, res) => {
   const terminals = loadJSON(TERMINALS_FILE);
