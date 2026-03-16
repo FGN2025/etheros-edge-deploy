@@ -1625,3 +1625,124 @@ app.get('/api/services/blacknut/status', async (req, res) => {
     res.json({ enabled: true, configured: true, reachable: false, error: String(err) });
   }
 });
+
+// ── Persistent Chat History ────────────────────────────────────────────────────
+//
+// Storage layout (per-tenant):
+//   ${DATA_DIR}/chats/${subscriberId}/${agentId}.json
+//
+// Each file is an array of messages:
+//   [{ role, content, timestamp }, ...]
+//
+// Endpoints:
+//   GET    /api/subscribers/:id/chats              → list agents with recent chat
+//   GET    /api/subscribers/:id/chats/:agentId     → last 50 messages for agent
+//   POST   /api/subscribers/:id/chats/:agentId     → append message { role, content }
+//   DELETE /api/subscribers/:id/chats/:agentId     → clear chat for agent
+//
+// All endpoints require Bearer token auth (parseToken).
+// The :id in the URL must match the token's subscriberId.
+
+const MAX_HISTORY = 50;
+
+function chatFile(subscriberId, agentId) {
+  return path.join(DATA_DIR, 'chats', subscriberId, `${agentId}.json`);
+}
+
+function loadChatHistory(subscriberId, agentId) {
+  const file = chatFile(subscriberId, agentId);
+  if (!fs.existsSync(file)) return [];
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return []; }
+}
+
+function saveChatHistory(subscriberId, agentId, messages) {
+  const dir = path.join(DATA_DIR, 'chats', subscriberId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(chatFile(subscriberId, agentId), JSON.stringify(messages, null, 2));
+}
+
+// ── Auth middleware check shared by all 4 chat endpoints ──────────────────────
+function requireSubscriberToken(req, res) {
+  const auth = (req.headers.authorization || '').replace('Bearer ', '');
+  const tokenSubId = parseToken(auth);
+  if (!tokenSubId) { res.status(401).json({ error: 'Invalid or expired token' }); return null; }
+  if (tokenSubId !== req.params.id) { res.status(403).json({ error: 'Forbidden' }); return null; }
+  return tokenSubId;
+}
+
+// GET /api/subscribers/:id/chats — list all agents with recent chat activity
+app.get('/api/subscribers/:id/chats', (req, res) => {
+  const subId = requireSubscriberToken(req, res);
+  if (!subId) return;
+
+  const chatsDir = path.join(DATA_DIR, 'chats', subId);
+  if (!fs.existsSync(chatsDir)) return res.json({ conversations: [] });
+
+  const agents = loadJSON(AGENTS_FILE);
+  const files = fs.readdirSync(chatsDir).filter(f => f.endsWith('.json'));
+
+  const conversations = files.map(file => {
+    const agentId = file.replace('.json', '');
+    const messages = loadChatHistory(subId, agentId);
+    const last = messages[messages.length - 1] || null;
+    const agent = agents.find(a => a.id === agentId);
+    return {
+      agentId,
+      agentName: agent?.name || agentId,
+      agentCategory: agent?.category || null,
+      messageCount: messages.length,
+      lastMessage: last ? {
+        role: last.role,
+        content: last.content.slice(0, 120),
+        timestamp: last.timestamp,
+      } : null,
+    };
+  }).filter(c => c.lastMessage);
+
+  // Sort by last message timestamp descending
+  conversations.sort((a, b) =>
+    new Date(b.lastMessage.timestamp).getTime() - new Date(a.lastMessage.timestamp).getTime()
+  );
+
+  res.json({ conversations });
+});
+
+// GET /api/subscribers/:id/chats/:agentId — load last 50 messages
+app.get('/api/subscribers/:id/chats/:agentId', (req, res) => {
+  const subId = requireSubscriberToken(req, res);
+  if (!subId) return;
+
+  const all = loadChatHistory(subId, req.params.agentId);
+  const messages = all.slice(-MAX_HISTORY);
+  res.json({ messages, total: all.length });
+});
+
+// POST /api/subscribers/:id/chats/:agentId — append a message { role, content }
+app.post('/api/subscribers/:id/chats/:agentId', (req, res) => {
+  const subId = requireSubscriberToken(req, res);
+  if (!subId) return;
+
+  const { role, content } = req.body || {};
+  if (!role || !content) return res.status(400).json({ error: 'role and content required' });
+  if (!['user', 'assistant'].includes(role)) return res.status(400).json({ error: 'role must be user or assistant' });
+
+  const messages = loadChatHistory(subId, req.params.agentId);
+  const newMsg = { role, content, timestamp: new Date().toISOString() };
+  messages.push(newMsg);
+
+  // Keep only the last MAX_HISTORY * 2 messages on disk (trim on write)
+  const trimmed = messages.slice(-(MAX_HISTORY * 2));
+  saveChatHistory(subId, req.params.agentId, trimmed);
+
+  res.json({ ok: true, message: newMsg, total: trimmed.length });
+});
+
+// DELETE /api/subscribers/:id/chats/:agentId — clear all chat history for an agent
+app.delete('/api/subscribers/:id/chats/:agentId', (req, res) => {
+  const subId = requireSubscriberToken(req, res);
+  if (!subId) return;
+
+  const file = chatFile(subId, req.params.agentId);
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+  res.json({ ok: true });
+});
