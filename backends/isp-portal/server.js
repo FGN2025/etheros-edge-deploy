@@ -559,7 +559,7 @@ app.post('/api/subscribers/:id/billing/checkout', async (req, res) => {
       metadata: {
         subscriberId: subscriber.id,
         plan: subscriber.plan,
-        ispName: settings.ispName || 'EtherOS',
+        ispName: loadSettings().ispName || 'EtherOS',
       },
     };
     if (subscriber.stripeCustomerId) params.customer = subscriber.stripeCustomerId;
