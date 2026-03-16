@@ -484,6 +484,148 @@ app.delete('/api/subscribers/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Phase 2: Subscriber Stripe Billing ───────────────────────────────────────
+
+const SUBSCRIBER_PLANS = {
+  personal:     { name: 'Personal',     priceMonthly: 1499, priceId: 'price_1TBPB5ERnCKuXiJaJSsWJBTw' },
+  professional: { name: 'Professional', priceMonthly: 3999, priceId: 'price_1TBPCzERnCKuXiJagZEPZAVk' },
+  charter:      { name: 'Charter',      priceMonthly: 9999, priceId: 'price_1TBPCzERnCKuXiJaB8DWJ84N' },
+};
+
+// POST /api/subscribers/billing/batch-invite — MUST be before /:id routes to avoid routing conflict
+app.post('/api/subscribers/billing/batch-invite', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured. Add your Stripe secret key in Settings.' });
+
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const { successUrl, cancelUrl } = req.body;
+
+  const unbilled = subscribers.filter(s => !s.billingStatus || s.billingStatus === 'none');
+  let invited = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const sub of unbilled) {
+    const plan = SUBSCRIBER_PLANS[sub.plan];
+    if (!plan) { skipped++; continue; }
+    try {
+      const params = {
+        mode: 'subscription',
+        line_items: [{ price: plan.priceId, quantity: 1 }],
+        customer_email: sub.email,
+        success_url: successUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=success',
+        cancel_url: cancelUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=canceled',
+        metadata: { subscriberId: sub.id, plan: sub.plan },
+      };
+      const session = await stripe.checkout.sessions.create(params);
+      const idx = subscribers.findIndex(s => s.id === sub.id);
+      subscribers[idx].billingStatus = 'invited';
+      subscribers[idx].billingInvitedAt = new Date().toISOString();
+      subscribers[idx].stripeCheckoutSessionId = session.id;
+      invited++;
+    } catch (err) {
+      console.error('batch-invite error for', sub.email, err.message);
+      errors++;
+    }
+  }
+
+  saveJSON(SUBSCRIBERS_FILE, subscribers);
+  const alreadyBilled = subscribers.length - unbilled.length;
+  res.json({ invited, skipped: alreadyBilled + skipped, errors, total: subscribers.length });
+});
+
+// POST /api/subscribers/:id/billing/checkout — create Stripe checkout for a subscriber
+app.post('/api/subscribers/:id/billing/checkout', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured. Add your Stripe secret key in Settings.' });
+
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const idx = subscribers.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Subscriber not found' });
+
+  const subscriber = subscribers[idx];
+  const plan = SUBSCRIBER_PLANS[subscriber.plan];
+  if (!plan) return res.status(400).json({ error: 'Unknown plan: ' + subscriber.plan });
+
+  const { successUrl, cancelUrl } = req.body;
+
+  try {
+    const params = {
+      mode: 'subscription',
+      line_items: [{ price: plan.priceId, quantity: 1 }],
+      customer_email: subscriber.stripeCustomerId ? undefined : subscriber.email,
+      success_url: successUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=success',
+      cancel_url: cancelUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers?billing=canceled',
+      metadata: {
+        subscriberId: subscriber.id,
+        plan: subscriber.plan,
+        ispName: settings.ispName || 'EtherOS',
+      },
+    };
+    if (subscriber.stripeCustomerId) params.customer = subscriber.stripeCustomerId;
+
+    const session = await stripe.checkout.sessions.create(params);
+
+    // Save customerId + mark as invited
+    subscriber.stripeCustomerId = subscriber.stripeCustomerId || (session.customer || null);
+    subscriber.billingStatus = 'invited';
+    subscriber.billingInvitedAt = new Date().toISOString();
+    subscribers[idx] = subscriber;
+    saveJSON(SUBSCRIBERS_FILE, subscribers);
+
+    res.json({ checkoutUrl: session.url, sessionId: session.id, subscriber });
+  } catch (err) {
+    console.error('Subscriber checkout error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/subscribers/:id/billing/portal — Stripe customer portal for a subscriber
+app.post('/api/subscribers/:id/billing/portal', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured' });
+
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const sub = subscribers.find(s => s.id === req.params.id);
+  if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
+  if (!sub.stripeCustomerId) return res.status(400).json({ error: 'No Stripe customer for this subscriber' });
+
+  const { returnUrl } = req.body;
+  try {
+    const session = await stripe.billingPortal.sessions.create({
+      customer: sub.stripeCustomerId,
+      return_url: returnUrl || 'https://edge.etheros.ai/isp-portal/#/subscribers',
+    });
+    res.json({ portalUrl: session.url });
+  } catch (err) {
+    console.error('Subscriber portal error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/subscribers/:id/billing — billing status for a specific subscriber
+app.get('/api/subscribers/:id/billing', async (req, res) => {
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const sub = subscribers.find(s => s.id === req.params.id);
+  if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
+
+  const stripe = getStripe();
+  if (stripe && sub.stripeSubscriptionId) {
+    try {
+      const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+      // Sync status back
+      const subIdx = subscribers.findIndex(s => s.id === req.params.id);
+      subscribers[subIdx].billingStatus = stripeSub.status === 'active' ? 'active'
+        : stripeSub.status === 'past_due' ? 'past_due'
+        : stripeSub.status === 'canceled' ? 'canceled'
+        : sub.billingStatus || 'invited';
+      saveJSON(SUBSCRIBERS_FILE, subscribers);
+      return res.json(subscribers[subIdx]);
+    } catch {}
+  }
+  res.json(sub);
+});
+
 // ── Dashboard KPIs ──────────────────────────────────────────────────────────
 app.get('/api/dashboard', (req, res) => {
   const terminals = loadJSON(TERMINALS_FILE);
