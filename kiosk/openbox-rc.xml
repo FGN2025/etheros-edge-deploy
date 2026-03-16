@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EtherOS Kiosk — Openbox Configuration
+  /etc/etheros/openbox-rc.xml
+
+  Locked-down desktop:
+  - No right-click context menu
+  - No window decorations
+  - No taskbar or panel
+  - Chromium fills the entire screen
+  - All window management keybindings removed except recovery TTY
+-->
+<openbox_config xmlns="http://openbox.org/3.4/rc"
+                xmlns:xi="http://www.w3.org/2001/XInclude">
+
+  <resistance>
+    <strength>10</strength>
+    <screen_edge_strength>20</screen_edge_strength>
+  </resistance>
+
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+    <focusLast>yes</focusLast>
+    <underMouse>no</underMouse>
+    <focusDelay>200</focusDelay>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+
+  <placement>
+    <policy>Smart</policy>
+    <center>yes</center>
+    <monitor>Primary</monitor>
+    <primaryMonitor>1</primaryMonitor>
+  </placement>
+
+  <theme>
+    <name>Clearlooks</name>
+    <titleLayout>NLIMC</titleLayout>
+    <keepBorder>yes</keepBorder>
+    <animateIconify>no</animateIconify>
+    <font place="ActiveWindow">
+      <name>sans</name>
+      <size>8</size>
+      <weight>bold</weight>
+      <slant>normal</slant>
+    </font>
+    <font place="InactiveWindow">
+      <name>sans</name>
+      <size>8</size>
+      <weight>bold</weight>
+      <slant>normal</slant>
+    </font>
+  </theme>
+
+  <desktops>
+    <number>1</number>
+    <firstdesk>1</firstdesk>
+    <names>
+      <name>EtherOS</name>
+    </names>
+    <popupTime>0</popupTime>
+  </desktops>
+
+  <resize>
+    <drawContents>yes</drawContents>
+    <popupShow>Nonpixel</popupShow>
+    <popupPosition>Center</popupPosition>
+    <popupFixedPosition>
+      <x>10</x>
+      <y>10</y>
+    </popupFixedPosition>
+  </resize>
+
+  <margins>
+    <top>0</top>
+    <bottom>0</bottom>
+    <left>0</left>
+    <right>0</right>
+  </margins>
+
+  <dock>
+    <position>TopLeft</position>
+    <floatingX>0</floatingX>
+    <floatingY>0</floatingY>
+    <noStrut>no</noStrut>
+    <stacking>Above</stacking>
+    <direction>Vertical</direction>
+    <autoHide>no</autoHide>
+    <hideDelay>300</hideDelay>
+    <showDelay>300</showDelay>
+    <moveButton>Middle</moveButton>
+  </dock>
+
+  <keyboard>
+    <chainQuitKey>C-g</chainQuitKey>
+
+    <!-- ── Recovery TTY access (always preserved) ───────── -->
+    <!-- Ctrl+Alt+F1–F6 drop to TTY — handled by kernel, not Openbox -->
+    <!-- These cannot and should not be blocked -->
+
+    <!-- ── All other keybindings removed ────────────────── -->
+    <!-- No Alt+F4, no Alt+Tab, no window cycling -->
+    <!-- Chromium's own kiosk mode handles F11/fullscreen -->
+
+  </keyboard>
+
+  <mouse>
+    <!-- ── No context menus on desktop ──────────────────── -->
+    <dragThreshold>1</dragThreshold>
+    <doubleClickTime>200</doubleClickTime>
+    <screenEdgeWarpTime>400</screenEdgeWarpTime>
+    <screenEdgeWarpMouse>false</screenEdgeWarpMouse>
+
+    <context name="Frame">
+      <mousebind button="A-Left" action="Press">
+        <action name="Focus"/>
+        <action name="Raise"/>
+      </mousebind>
+    </context>
+
+    <!-- Root (desktop) context — no menu, no actions -->
+    <context name="Desktop">
+      <!-- Intentionally empty — no right-click, no scroll-desktop -->
+    </context>
+
+    <context name="Client">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/>
+        <action name="Raise"/>
+      </mousebind>
+    </context>
+
+    <context name="Titlebar">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/>
+        <action name="Raise"/>
+      </mousebind>
+    </context>
+
+    <context name="MoveResize">
+      <mousebind button="Left" action="Release">
+        <action name="EndMoveResize"/>
+      </mousebind>
+    </context>
+  </mouse>
+
+  <menu>
+    <!-- No menu files — context menus completely disabled -->
+    <hideDelay>200</hideDelay>
+    <middle>no</middle>
+    <submenuShowDelay>100</submenuShowDelay>
+    <submenuHideDelay>400</submenuHideDelay>
+    <applicationIcons>no</applicationIcons>
+    <manageDesktops>no</manageDesktops>
+  </menu>
+
+  <applications>
+    <!-- Force Chromium to always be fullscreen, no decorations -->
+    <application class="Chromium-browser" name="chromium-browser">
+      <decor>no</decor>
+      <shade>no</shade>
+      <maximized>yes</maximized>
+      <fullscreen>yes</fullscreen>
+      <desktop>1</desktop>
+      <layer>normal</layer>
+      <skip_pager>yes</skip_pager>
+      <skip_taskbar>yes</skip_taskbar>
+    </application>
+    <application class="Chromium" name="chromium">
+      <decor>no</decor>
+      <shade>no</shade>
+      <maximized>yes</maximized>
+      <fullscreen>yes</fullscreen>
+      <desktop>1</desktop>
+      <layer>normal</layer>
+      <skip_pager>yes</skip_pager>
+      <skip_taskbar>yes</skip_taskbar>
+    </application>
+  </applications>
+
+</openbox_config>

@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EtherOS — Connecting…</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      hsl(212, 52%, 7%);
+      --surface: hsl(212, 48%, 9%);
+      --border:  hsl(212, 30%, 16%);
+      --text:    hsl(210, 40%, 96%);
+      --muted:   hsl(215, 20%, 50%);
+      --accent:  ACCENT_COLOR_PLACEHOLDER;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+    }
+
+    @keyframes pulse-ring {
+      0%   { transform: scale(0.95); opacity: 0.5; }
+      50%  { transform: scale(1.05); opacity: 0.2; }
+      100% { transform: scale(0.95); opacity: 0.5; }
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @keyframes fade-in {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .container {
+      text-align: center;
+      max-width: 420px;
+      padding: 2rem;
+      animation: fade-in 0.6s ease both;
+    }
+
+    /* Logo mark */
+    .logo-wrap {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 2.5rem;
+    }
+
+    .logo-ring {
+      position: relative;
+      width: 80px;
+      height: 80px;
+    }
+
+    .logo-ring::before {
+      content: '';
+      position: absolute;
+      inset: -8px;
+      border-radius: 50%;
+      border: 2px solid var(--accent);
+      opacity: 0.3;
+      animation: pulse-ring 2s ease-in-out infinite;
+    }
+
+    .logo-inner {
+      width: 80px;
+      height: 80px;
+      border-radius: 20px;
+      background: color-mix(in srgb, var(--accent) 12%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .logo-inner svg {
+      width: 36px;
+      height: 36px;
+    }
+
+    /* Wordmark */
+    .wordmark {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.5rem;
+    }
+
+    .wordmark span {
+      color: var(--accent);
+    }
+
+    .isp-name {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 2rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    /* Status */
+    .status-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 2.5rem;
+    }
+
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 2.5px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    .status-text {
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    .status-text strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    /* Countdown */
+    #countdown {
+      font-size: 0.75rem;
+      color: color-mix(in srgb, var(--muted) 70%, transparent);
+    }
+
+    /* Support card */
+    .support-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.25rem 1.5rem;
+      display: none;
+      flex-direction: column;
+      gap: 0.5rem;
+      text-align: left;
+      animation: fade-in 0.4s ease both;
+    }
+
+    .support-card.visible {
+      display: flex;
+    }
+
+    .support-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 0.25rem;
+    }
+
+    .support-row {
+      display: flex;
+      align-items: center;
+      gap: 0.625rem;
+      font-size: 0.8rem;
+      color: var(--text);
+    }
+
+    .support-row svg {
+      flex-shrink: 0;
+      color: var(--accent);
+    }
+
+    /* Retry button */
+    .retry-btn {
+      margin-top: 1.5rem;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      background: color-mix(in srgb, var(--accent) 15%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+      color: var(--accent);
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.6rem 1.5rem;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+      width: 100%;
+    }
+
+    .retry-btn:hover {
+      background: color-mix(in srgb, var(--accent) 25%, transparent);
+    }
+
+    .retry-btn.visible {
+      display: flex;
+    }
+
+    /* Footer */
+    .footer {
+      position: fixed;
+      bottom: 1.5rem;
+      left: 0;
+      right: 0;
+      text-align: center;
+      font-size: 0.65rem;
+      color: color-mix(in srgb, var(--muted) 50%, transparent);
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Logo -->
+  <div class="logo-wrap">
+    <div class="logo-ring">
+      <div class="logo-inner">
+        <svg viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="2" y="6" width="22" height="22" rx="5" fill="currentColor" opacity="0.15" style="color:var(--accent)"/>
+          <path d="M6 13h14M6 18h10M6 23h14" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wordmark -->
+  <div class="wordmark">Ether<span>OS</span></div>
+  <div class="isp-name" id="isp-name">ISP_NAME_PLACEHOLDER</div>
+
+  <!-- Spinner + status -->
+  <div class="status-wrap">
+    <div class="spinner" id="spinner"></div>
+    <div class="status-text">
+      <strong id="status-heading">Connecting to network…</strong>
+    </div>
+    <div id="countdown"></div>
+  </div>
+
+  <!-- Support card — shown after timeout -->
+  <div class="support-card" id="support-card">
+    <div class="support-label">Need help? Contact your ISP</div>
+
+    <div class="support-row" id="row-phone" style="display:none">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.61 3.18 2 2 0 0 1 3.6 1h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 8.91a16 16 0 0 0 6 6l.76-.76a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
+      </svg>
+      <span id="support-phone">SUPPORT_PHONE_PLACEHOLDER</span>
+    </div>
+
+    <div class="support-row" id="row-email" style="display:none">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>
+      </svg>
+      <span id="support-email">SUPPORT_EMAIL_PLACEHOLDER</span>
+    </div>
+
+    <div class="support-row" id="row-url" style="display:none">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+      </svg>
+      <span id="support-url">SUPPORT_URL_PLACEHOLDER</span>
+    </div>
+  </div>
+
+  <!-- Retry button -->
+  <button class="retry-btn" id="retry-btn" onclick="retryConnection()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+    </svg>
+    Try Again
+  </button>
+
+</div>
+
+<div class="footer">Powered by EtherOS · etheros.ai</div>
+
+<script>
+  // Values injected by bootstrap script at deploy time
+  const CONFIG = {
+    kioskUrl:     'KIOSK_URL_PLACEHOLDER',
+    ispName:      'ISP_NAME_PLACEHOLDER',
+    accentColor:  'ACCENT_COLOR_PLACEHOLDER',
+    supportPhone: 'SUPPORT_PHONE_PLACEHOLDER',
+    supportEmail: 'SUPPORT_EMAIL_PLACEHOLDER',
+    supportUrl:   'SUPPORT_URL_PLACEHOLDER',
+    timeout:      NETWORK_TIMEOUT_PLACEHOLDER,
+  };
+
+  // Apply accent color from config
+  document.documentElement.style.setProperty('--accent', CONFIG.accentColor);
+
+  // Show support rows if values provided
+  if (CONFIG.supportPhone && CONFIG.supportPhone !== 'SUPPORT_PHONE_PLACEHOLDER') {
+    document.getElementById('row-phone').style.display = 'flex';
+    document.getElementById('support-phone').textContent = CONFIG.supportPhone;
+  }
+  if (CONFIG.supportEmail && CONFIG.supportEmail !== 'SUPPORT_EMAIL_PLACEHOLDER') {
+    document.getElementById('row-email').style.display = 'flex';
+    document.getElementById('support-email').textContent = CONFIG.supportEmail;
+  }
+  if (CONFIG.supportUrl && CONFIG.supportUrl !== 'SUPPORT_URL_PLACEHOLDER') {
+    document.getElementById('row-url').style.display = 'flex';
+    document.getElementById('support-url').textContent = CONFIG.supportUrl.replace(/^https?:\/\//, '');
+  }
+
+  // Countdown timer
+  let remaining = CONFIG.timeout;
+  const countdownEl = document.getElementById('countdown');
+  const iv = setInterval(() => {
+    remaining--;
+    if (remaining > 0) {
+      countdownEl.textContent = `Retrying in ${remaining}s…`;
+    } else {
+      clearInterval(iv);
+    }
+  }, 1000);
+
+  // After timeout — show support card + retry button, update heading
+  setTimeout(() => {
+    clearInterval(iv);
+    countdownEl.textContent = '';
+    document.getElementById('spinner').style.borderTopColor = '#EF4444';
+    document.getElementById('status-heading').textContent = 'No network connection';
+    document.getElementById('support-card').classList.add('visible');
+    document.getElementById('retry-btn').classList.add('visible');
+  }, CONFIG.timeout * 1000);
+
+  // Retry: reload the page — the kiosk service will re-check connectivity
+  function retryConnection() {
+    window.location.href = CONFIG.kioskUrl;
+  }
+
+  // Try to load the real terminal — if it succeeds, navigate there
+  function checkConnectivity() {
+    fetch(CONFIG.kioskUrl, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' })
+      .then(() => { window.location.href = CONFIG.kioskUrl; })
+      .catch(() => {}); // Stay on offline page
+  }
+
+  // Check every 15s
+  setInterval(checkConnectivity, 15000);
+  // Check once immediately after a brief delay
+  setTimeout(checkConnectivity, 2000);
+</script>
+</body>
+</html>

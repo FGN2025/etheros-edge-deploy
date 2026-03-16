@@ -1,0 +1,38 @@
+# /etc/systemd/system/etheros-kiosk.service
+# EtherOS Kiosk — starts the X session + Openbox + Chromium as the kiosk user.
+# Installed by etheros-kiosk-bootstrap.sh. Do not edit manually.
+# To reconfigure, edit /etc/etheros/kiosk.conf and run:
+#   sudo systemctl restart etheros-kiosk
+
+[Unit]
+Description=EtherOS Kiosk Session
+After=network-online.target graphical.target
+Wants=network-online.target
+# Restart if Chromium crashes
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=KIOSK_USER_PLACEHOLDER
+Group=KIOSK_USER_PLACEHOLDER
+
+# Environment
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/KIOSK_USER_PLACEHOLDER/.Xauthority
+Environment=HOME=/home/KIOSK_USER_PLACEHOLDER
+
+# Launch wrapper script that handles USB config override + network check
+ExecStart=/usr/local/bin/etheros-kiosk-launch.sh
+
+# Always restart on exit/crash — kiosk should never stay down
+Restart=always
+RestartSec=5
+
+# Suppress lingering TTY output
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=etheros-kiosk
+
+[Install]
+WantedBy=graphical.target
