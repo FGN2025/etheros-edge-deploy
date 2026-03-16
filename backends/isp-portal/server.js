@@ -1822,3 +1822,363 @@ app.delete('/api/subscribers/:id/chats/:agentId', (req, res) => {
   if (fs.existsSync(file)) fs.unlinkSync(file);
   res.json({ ok: true });
 });
+
+// ============================================================
+//  Sprint 4I — Marketing Console Core
+//  Roles: isp_admin (full CRUD), isp_marketer (own campaigns),
+//         isp_manager (view-only + marketing, same as marketer)
+//
+//  Data files (JSON, same DATA_DIR pattern):
+//    $DATA_DIR/marketing-campaigns.json
+//    $DATA_DIR/marketing-pages.json
+//    $DATA_DIR/marketing-users.json  ← { marketerUsers: [{id,name,email,token}] }
+//
+//  Auth:
+//    Admin endpoints → x-admin-token header == settings.adminToken (or any truthy)
+//    Marketer/Manager → Authorization: Bearer <marketerToken>
+//    Public page view → no auth (GET /api/marketing/pages/:slug/view)
+// ============================================================
+
+const CAMPAIGNS_FILE      = `${DATA_DIR}/marketing-campaigns.json`;
+const MARKETING_PAGES_FILE = `${DATA_DIR}/marketing-pages.json`;
+const MKTG_USERS_FILE     = `${DATA_DIR}/marketing-users.json`;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function loadCampaigns() {
+  try { return JSON.parse(fs.readFileSync(CAMPAIGNS_FILE, 'utf8')); } catch { return []; }
+}
+function saveCampaigns(d) {
+  fs.mkdirSync(path.dirname(CAMPAIGNS_FILE), { recursive: true });
+  fs.writeFileSync(CAMPAIGNS_FILE, JSON.stringify(d, null, 2));
+}
+
+function loadMktgPages() {
+  try { return JSON.parse(fs.readFileSync(MARKETING_PAGES_FILE, 'utf8')); } catch { return []; }
+}
+function saveMktgPages(d) {
+  fs.mkdirSync(path.dirname(MARKETING_PAGES_FILE), { recursive: true });
+  fs.writeFileSync(MARKETING_PAGES_FILE, JSON.stringify(d, null, 2));
+}
+
+function loadMktgUsers() {
+  try { return JSON.parse(fs.readFileSync(MKTG_USERS_FILE, 'utf8')); } catch { return { marketerUsers: [] }; }
+}
+function saveMktgUsers(d) {
+  fs.mkdirSync(path.dirname(MKTG_USERS_FILE), { recursive: true });
+  fs.writeFileSync(MKTG_USERS_FILE, JSON.stringify(d, null, 2));
+}
+
+// Resolve caller role: 'admin' | 'marketer' | null
+function resolveMktgRole(req) {
+  // Admin token check (x-admin-token header, or settings has no adminToken set → dev mode open)
+  const adminHeader = req.headers['x-admin-token'] || '';
+  const s = loadSettings();
+  if (!s.adminToken || adminHeader === s.adminToken) return 'admin';
+
+  // Marketer / Manager token
+  const bearer = (req.headers.authorization || '').replace('Bearer ', '').trim();
+  if (!bearer) return null;
+  const mu = loadMktgUsers();
+  const user = (mu.marketerUsers || []).find(u => u.token === bearer && u.active !== false);
+  if (user) return 'marketer';
+
+  return null;
+}
+
+function requireMktgAccess(req, res) {
+  const role = resolveMktgRole(req);
+  if (!role) { res.status(401).json({ error: 'Marketing auth required' }); return null; }
+  return role;
+}
+
+function mktgId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+// ── Marketer User Management ──────────────────────────────────────────────────
+
+// GET /api/marketing/users — list marketer/manager users (admin only)
+app.get('/api/marketing/users', (req, res) => {
+  if (resolveMktgRole(req) !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const mu = loadMktgUsers();
+  res.json(mu.marketerUsers || []);
+});
+
+// POST /api/marketing/users — create marketer user (admin only)
+app.post('/api/marketing/users', (req, res) => {
+  if (resolveMktgRole(req) !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, email, role: userRole } = req.body || {};
+  if (!name || !email) return res.status(400).json({ error: 'name and email required' });
+  const mu = loadMktgUsers();
+  const newUser = {
+    id: mktgId(),
+    name,
+    email,
+    role: userRole || 'marketer', // 'marketer' | 'manager'
+    token: require('crypto').randomBytes(24).toString('hex'),
+    active: true,
+    createdAt: new Date().toISOString(),
+  };
+  mu.marketerUsers = [...(mu.marketerUsers || []), newUser];
+  saveMktgUsers(mu);
+  res.json(newUser);
+});
+
+// DELETE /api/marketing/users/:id — remove marketer user (admin only)
+app.delete('/api/marketing/users/:id', (req, res) => {
+  if (resolveMktgRole(req) !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const mu = loadMktgUsers();
+  mu.marketerUsers = (mu.marketerUsers || []).filter(u => u.id !== req.params.id);
+  saveMktgUsers(mu);
+  res.json({ ok: true });
+});
+
+// GET /api/marketing/me — resolve current caller's identity
+app.get('/api/marketing/me', (req, res) => {
+  const role = resolveMktgRole(req);
+  if (!role) return res.status(401).json({ error: 'Unauthorized' });
+  if (role === 'admin') return res.json({ role: 'admin', name: 'Admin' });
+  const bearer = (req.headers.authorization || '').replace('Bearer ', '').trim();
+  const mu = loadMktgUsers();
+  const user = (mu.marketerUsers || []).find(u => u.token === bearer);
+  res.json({ role: user?.role || 'marketer', name: user?.name || 'Marketer', id: user?.id });
+});
+
+// ── Campaigns ─────────────────────────────────────────────────────────────────
+//
+//  Campaign shape:
+//  {
+//    id, name, type ('social'|'email'|'page'), status ('draft'|'published'|'scheduled'|'archived'),
+//    agentId, agentName, agentCategory, agentImageUrl,
+//    headline, body, ctaText, ctaUrl, heroImageUrl,
+//    targetPlans (['personal','professional','charter']),
+//    scheduledAt (ISO string | null),
+//    createdBy ('admin' | marketerUserId),
+//    createdAt, updatedAt
+//  }
+
+// GET /api/marketing/campaigns
+app.get('/api/marketing/campaigns', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+  let campaigns = loadCampaigns();
+
+  // Filter by status if provided
+  if (req.query.status) {
+    campaigns = campaigns.filter(c => c.status === req.query.status);
+  }
+  // Filter by type if provided
+  if (req.query.type) {
+    campaigns = campaigns.filter(c => c.type === req.query.type);
+  }
+  res.json(campaigns);
+});
+
+// POST /api/marketing/campaigns
+app.post('/api/marketing/campaigns', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+
+  const {
+    name, type, agentId, agentName, agentCategory, agentImageUrl,
+    headline, body, ctaText, ctaUrl, heroImageUrl,
+    targetPlans, scheduledAt, status,
+  } = req.body || {};
+
+  if (!name) return res.status(400).json({ error: 'name is required' });
+
+  // Resolve createdBy
+  let createdBy = 'admin';
+  if (role !== 'admin') {
+    const bearer = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const mu = loadMktgUsers();
+    const user = (mu.marketerUsers || []).find(u => u.token === bearer);
+    createdBy = user?.id || 'marketer';
+  }
+
+  const campaigns = loadCampaigns();
+  const newCampaign = {
+    id: mktgId(),
+    name,
+    type: type || 'social',
+    status: status || 'draft',
+    agentId: agentId || null,
+    agentName: agentName || null,
+    agentCategory: agentCategory || null,
+    agentImageUrl: agentImageUrl || null,
+    headline: headline || '',
+    body: body || '',
+    ctaText: ctaText || 'Try it now',
+    ctaUrl: ctaUrl || '',
+    heroImageUrl: heroImageUrl || agentImageUrl || null,
+    targetPlans: targetPlans || ['personal', 'professional', 'charter'],
+    scheduledAt: scheduledAt || null,
+    createdBy,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  campaigns.push(newCampaign);
+  saveCampaigns(campaigns);
+  res.status(201).json(newCampaign);
+});
+
+// PATCH /api/marketing/campaigns/:id
+app.patch('/api/marketing/campaigns/:id', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+
+  const campaigns = loadCampaigns();
+  const idx = campaigns.findIndex(c => c.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Campaign not found' });
+
+  // Marketers can only edit their own campaigns
+  if (role !== 'admin') {
+    const bearer = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const mu = loadMktgUsers();
+    const user = (mu.marketerUsers || []).find(u => u.token === bearer);
+    if (campaigns[idx].createdBy !== user?.id) {
+      return res.status(403).json({ error: 'You can only edit your own campaigns' });
+    }
+  }
+
+  const updated = {
+    ...campaigns[idx],
+    ...req.body,
+    id: campaigns[idx].id,       // immutable
+    createdBy: campaigns[idx].createdBy, // immutable
+    createdAt: campaigns[idx].createdAt, // immutable
+    updatedAt: new Date().toISOString(),
+  };
+  campaigns[idx] = updated;
+  saveCampaigns(campaigns);
+  res.json(updated);
+});
+
+// DELETE /api/marketing/campaigns/:id
+app.delete('/api/marketing/campaigns/:id', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+
+  const campaigns = loadCampaigns();
+  const idx = campaigns.findIndex(c => c.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Campaign not found' });
+
+  // Marketers can only delete their own
+  if (role !== 'admin') {
+    const bearer = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const mu = loadMktgUsers();
+    const user = (mu.marketerUsers || []).find(u => u.token === bearer);
+    if (campaigns[idx].createdBy !== user?.id) {
+      return res.status(403).json({ error: 'You can only delete your own campaigns' });
+    }
+  }
+
+  campaigns.splice(idx, 1);
+  saveCampaigns(campaigns);
+  res.json({ ok: true });
+});
+
+// ── Marketing Pages ───────────────────────────────────────────────────────────
+//
+//  Page shape:
+//  {
+//    id, slug, title, heroImageUrl, headline, bodyHtml,
+//    features ([{icon,text}]),
+//    ctaText, ctaUrl (defaults to /#/terminal),
+//    agentId, agentName,
+//    published (bool),
+//    createdAt, updatedAt
+//  }
+
+// GET /api/marketing/pages
+app.get('/api/marketing/pages', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+  res.json(loadMktgPages());
+});
+
+// GET /api/marketing/pages/:slug/view — PUBLIC (no auth, renders page data)
+app.get('/api/marketing/pages/:slug/view', (req, res) => {
+  const pages = loadMktgPages();
+  const page = pages.find(p => p.slug === req.params.slug && p.published);
+  if (!page) return res.status(404).json({ error: 'Page not found or not published' });
+  const s = loadSettings();
+  res.json({ ...page, ispName: s.ispName || 'EtherOS', accentColor: s.accentColor || '#00C2CB' });
+});
+
+// POST /api/marketing/pages
+app.post('/api/marketing/pages', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+
+  const { slug, title, heroImageUrl, headline, bodyHtml, features, ctaText, ctaUrl, agentId, agentName, published } = req.body || {};
+  if (!slug || !title) return res.status(400).json({ error: 'slug and title required' });
+
+  const pages = loadMktgPages();
+  if (pages.find(p => p.slug === slug)) return res.status(409).json({ error: 'Slug already exists' });
+
+  const newPage = {
+    id: mktgId(),
+    slug,
+    title,
+    heroImageUrl: heroImageUrl || null,
+    headline: headline || title,
+    bodyHtml: bodyHtml || '',
+    features: features || [],
+    ctaText: ctaText || 'Try it now',
+    ctaUrl: ctaUrl || '/#/terminal',
+    agentId: agentId || null,
+    agentName: agentName || null,
+    published: published || false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  pages.push(newPage);
+  saveMktgPages(pages);
+  res.status(201).json(newPage);
+});
+
+// PATCH /api/marketing/pages/:id
+app.patch('/api/marketing/pages/:id', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+
+  const pages = loadMktgPages();
+  const idx = pages.findIndex(p => p.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Page not found' });
+
+  // Slug uniqueness check if changing
+  if (req.body.slug && req.body.slug !== pages[idx].slug) {
+    if (pages.find(p => p.slug === req.body.slug)) {
+      return res.status(409).json({ error: 'Slug already exists' });
+    }
+  }
+
+  pages[idx] = {
+    ...pages[idx],
+    ...req.body,
+    id: pages[idx].id,
+    createdAt: pages[idx].createdAt,
+    updatedAt: new Date().toISOString(),
+  };
+  saveMktgPages(pages);
+  res.json(pages[idx]);
+});
+
+// DELETE /api/marketing/pages/:id
+app.delete('/api/marketing/pages/:id', (req, res) => {
+  const role = requireMktgAccess(req, res);
+  if (!role) return;
+
+  const pages = loadMktgPages();
+  const idx = pages.findIndex(p => p.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Page not found' });
+
+  pages.splice(idx, 1);
+  saveMktgPages(pages);
+  res.json({ ok: true });
+});
+
+// ── End Sprint 4I ─────────────────────────────────────────────────────────────
