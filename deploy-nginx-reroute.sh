@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/FGN2025/etheros-edge-deploy/main"
-NGINX_CONF="/opt/etheros-edge/nginx/conf.d/etheros.conf"
+NGINX_CONF="/opt/etheros-edge/nginx/conf.d/etheros-edge.conf"
 
 echo "╔══════════════════════════════════════════╗"
 echo "║  EtherOS — nginx reroute to ISP Portal   ║"
