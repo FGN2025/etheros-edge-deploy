@@ -266,13 +266,50 @@ app.post('/api/billing/webhook', async (req, res) => {
     switch (event.type) {
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
-      case 'customer.subscription.deleted':
-        if (event.data.object.id === billingState.subscriptionId || !billingState.subscriptionId) {
-          billingState.subscriptionId = event.data.object.id;
-          billingState.customerId = event.data.object.customer;
-          await syncSubscription(stripe, event.data.object.id);
+      case 'customer.subscription.deleted': {
+        const subObj = event.data.object;
+        // Sync ISP-level billing state
+        if (subObj.id === billingState.subscriptionId || !billingState.subscriptionId) {
+          billingState.subscriptionId = subObj.id;
+          billingState.customerId = subObj.customer;
+          await syncSubscription(stripe, subObj.id);
         }
+        // Sync subscriber record by stripeCustomerId
+        try {
+          const subs = loadJSON(SUBSCRIBERS_FILE);
+          const si = subs.findIndex(s => s.stripeCustomerId === subObj.customer);
+          if (si >= 0) {
+            const status = subObj.status;
+            subs[si].billingStatus = status === 'active' ? 'active'
+              : status === 'past_due' ? 'past_due'
+              : status === 'canceled' ? 'canceled'
+              : subs[si].billingStatus || 'invited';
+            subs[si].stripeSubscriptionId = subObj.id;
+            subs[si].currentPeriodEnd = subObj.current_period_end
+              ? new Date(subObj.current_period_end * 1000).toISOString() : null;
+            subs[si].cancelAtPeriodEnd = subObj.cancel_at_period_end || false;
+            if (event.type === 'customer.subscription.deleted') {
+              subs[si].billingStatus = 'canceled';
+            }
+            saveJSON(SUBSCRIBERS_FILE, subs);
+            console.log(`[4G] Subscriber ${subs[si].id} subscription synced: ${status}`);
+          }
+        } catch (e) { console.error('[4G] Subscriber subscription sync error:', e); }
         break;
+      }
+      case 'invoice.payment_failed': {
+        const inv = event.data.object;
+        try {
+          const subs = loadJSON(SUBSCRIBERS_FILE);
+          const si = subs.findIndex(s => s.stripeCustomerId === inv.customer);
+          if (si >= 0) {
+            subs[si].billingStatus = 'past_due';
+            saveJSON(SUBSCRIBERS_FILE, subs);
+            console.log(`[4G] Subscriber ${subs[si].id} marked past_due (payment failed)`);
+          }
+        } catch (e) { console.error('[4G] invoice.payment_failed sync error:', e); }
+        break;
+      }
       case 'checkout.session.completed': {
         const sess = event.data.object;
         if (sess.subscription) {
@@ -280,6 +317,21 @@ app.post('/api/billing/webhook', async (req, res) => {
           billingState.subscriptionId = sess.subscription;
           saveBillingState(billingState);
           await syncSubscription(stripe, sess.subscription);
+        }
+        // Sync subscriber record if this was a subscriber billing checkout
+        if (sess.metadata && sess.metadata.subscriberId) {
+          try {
+            const subs = loadJSON(SUBSCRIBERS_FILE);
+            const si = subs.findIndex(s => s.id === sess.metadata.subscriberId);
+            if (si >= 0) {
+              subs[si].stripeCustomerId = sess.customer || subs[si].stripeCustomerId;
+              if (sess.subscription) subs[si].stripeSubscriptionId = sess.subscription;
+              subs[si].billingStatus = 'active';
+              if (sess.metadata.plan) subs[si].plan = sess.metadata.plan;
+              saveJSON(SUBSCRIBERS_FILE, subs);
+              console.log(`[4G] Subscriber ${sess.metadata.subscriberId} billing activated`);
+            }
+          } catch (e) { console.error('[4G] Subscriber sync error:', e); }
         }
         // Auto-provision new ISP tenant if this is a sign-up checkout
         if (sess.metadata && sess.metadata.provision_type === 'new_isp' && sess.metadata.isp_slug) {
@@ -1088,6 +1140,119 @@ app.get('/api/subscribers/:id/billing', async (req, res) => {
     } catch {}
   }
   res.json(sub);
+});
+
+// POST /api/subscribers/:id/billing/upgrade — change plan via Stripe Checkout
+// Used by subscriber terminal (Option A: token from session)
+app.post('/api/subscribers/:id/billing/upgrade', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured' });
+
+  // Auth: subscriber token OR admin token
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const sub = subscribers.find(s => s.id === req.params.id);
+  if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
+  const settings = loadSettings();
+  const isAdmin = req.headers['x-admin-token'] === settings.adminToken;
+  const isSubscriber = token && sub.token === token;
+  if (!isAdmin && !isSubscriber) return res.status(403).json({ error: 'Forbidden' });
+
+  const { newPlan, successUrl, cancelUrl } = req.body;
+  const plan = SUBSCRIBER_PLANS[newPlan];
+  if (!plan) return res.status(400).json({ error: 'Invalid plan: ' + newPlan });
+
+  try {
+    // If subscriber already has an active subscription, update it immediately via Stripe API
+    if (sub.stripeSubscriptionId) {
+      const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+      const itemId = stripeSub.items.data[0]?.id;
+      if (itemId) {
+        await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+          items: [{ id: itemId, price: plan.priceId }],
+          proration_behavior: 'create_prorations',
+          metadata: { subscriberId: sub.id, plan: newPlan },
+        });
+        const idx = subscribers.findIndex(s => s.id === sub.id);
+        subscribers[idx].plan = newPlan;
+        subscribers[idx].billingStatus = 'active';
+        saveJSON(SUBSCRIBERS_FILE, subscribers);
+        return res.json({ ok: true, upgraded: true, plan: newPlan });
+      }
+    }
+    // No active subscription — create Checkout session
+    const params = {
+      mode: 'subscription',
+      line_items: [{ price: plan.priceId, quantity: 1 }],
+      customer_email: sub.stripeCustomerId ? undefined : sub.email,
+      success_url: successUrl || portalUrl(`/#/terminal?billing=success`),
+      cancel_url: cancelUrl || portalUrl(`/#/terminal?billing=canceled`),
+      metadata: { subscriberId: sub.id, plan: newPlan },
+    };
+    if (sub.stripeCustomerId) params.customer = sub.stripeCustomerId;
+    const session = await stripe.checkout.sessions.create(params);
+    res.json({ checkoutUrl: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error('[4G] Upgrade error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/subscribers/:id/billing/cancel — cancel at period end
+app.post('/api/subscribers/:id/billing/cancel', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured' });
+
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const idx = subscribers.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Subscriber not found' });
+  const sub = subscribers[idx];
+  const settings = loadSettings();
+  const isAdmin = req.headers['x-admin-token'] === settings.adminToken;
+  const isSubscriber = token && sub.token === token;
+  if (!isAdmin && !isSubscriber) return res.status(403).json({ error: 'Forbidden' });
+  if (!sub.stripeSubscriptionId) return res.status(400).json({ error: 'No active subscription' });
+
+  try {
+    await stripe.subscriptions.update(sub.stripeSubscriptionId, { cancel_at_period_end: true });
+    subscribers[idx].cancelAtPeriodEnd = true;
+    saveJSON(SUBSCRIBERS_FILE, subscribers);
+    res.json({ ok: true, cancelAtPeriodEnd: true });
+  } catch (err) {
+    console.error('[4G] Cancel error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/subscribers/:id/billing/reactivate — undo cancel_at_period_end
+app.post('/api/subscribers/:id/billing/reactivate', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(400).json({ error: 'Stripe not configured' });
+
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const subscribers = loadJSON(SUBSCRIBERS_FILE);
+  const idx = subscribers.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Subscriber not found' });
+  const sub = subscribers[idx];
+  const settings = loadSettings();
+  const isAdmin = req.headers['x-admin-token'] === settings.adminToken;
+  const isSubscriber = token && sub.token === token;
+  if (!isAdmin && !isSubscriber) return res.status(403).json({ error: 'Forbidden' });
+  if (!sub.stripeSubscriptionId) return res.status(400).json({ error: 'No active subscription' });
+
+  try {
+    await stripe.subscriptions.update(sub.stripeSubscriptionId, { cancel_at_period_end: false });
+    subscribers[idx].cancelAtPeriodEnd = false;
+    saveJSON(SUBSCRIBERS_FILE, subscribers);
+    res.json({ ok: true, cancelAtPeriodEnd: false });
+  } catch (err) {
+    console.error('[4G] Reactivate error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Agents ────────────────────────────────────────────────────────────────────
