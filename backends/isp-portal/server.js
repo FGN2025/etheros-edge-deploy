@@ -93,41 +93,42 @@ const shared = {
 
 // ── Route modules ─────────────────────────────────────────────────────────────
 
-// Terminals — terminal CRUD, register, heartbeat
+// Terminals — /api/terminals/**
 const terminalsRouter = require('./routes/terminals')(DATA_DIR);
-app.use('/api', terminalsRouter);
+app.use('/api/terminals', terminalsRouter);
 
-// Subscribers — subscriber CRUD, PIN auth, agent slots, billing, Blacknut, chat history
+// Subscribers — /api/subscribers/**
 const subscribersRouter = require('./routes/subscribers')(DATA_DIR, loadSettings, getStripe, portalUrl);
-app.use('/api', subscribersRouter);
+app.use('/api/subscribers', subscribersRouter);
 
-// Agents — agent catalog, seed defaults, toggle, browse
+// Agents — /api/agents/**
 const agentsRouter = require('./routes/agents')(DATA_DIR);
-app.use('/api', agentsRouter);
+app.use('/api/agents', agentsRouter);
 
-// Marketing — campaigns, marketing pages, marketer users
+// Marketing — /api/marketing/**
 const marketingRouter = require('./routes/marketing')(DATA_DIR, loadSettings);
-app.use('/api', marketingRouter);
+app.use('/api/marketing', marketingRouter);
 
-// Acquisition — landing pages, lead capture, lead inbox, Resend notify
+// Acquisition — /api/acquisition/**
 const acquisitionRouter = require('./routes/acquisition')(DATA_DIR, loadSettings);
-app.use('/api', acquisitionRouter);
+app.use('/api/acquisition', acquisitionRouter);
 
-// Billing — ISP Stripe billing, webhook, provision-tenant, tenants list
+// Billing — /api/billing/**
 const billingRouter = require('./routes/billing')(DATA_DIR, loadSettings, getStripe, portalUrl);
-app.use('/api', billingRouter);
+app.use('/api/billing', billingRouter);
 
-// Dashboard — KPIs, server-stats, revenue
+// Dashboard — /api/dashboard, /api/server-stats, /api/revenue
 const { createDashboardRouter } = require('./routes/dashboard');
 const dashboardRouter = createDashboardRouter(shared);
 app.use('/api', dashboardRouter);
 
-// Chat — SSE proxy to Ollama for subscriber terminal inline chat
+// Chat — /api/chat/stream
 const { createChatRouter } = require('./routes/chat');
 const chatRouter = createChatRouter(shared);
 app.use('/api', chatRouter);
 
-// Admin — settings, auth, edge-status, edge-chat, isp-config, terminal/config, tenant
+// Admin — /api/settings, /api/admin/*, /api/edge-*, /api/isp-config,
+//          /api/terminal/config, /api/tenant, /api/services/**
 const { createAdminRouter } = require('./routes/admin');
 const adminRouter = createAdminRouter(shared);
 app.use('/api', adminRouter);
