@@ -253,4 +253,27 @@ function createAdminRouter(helpers) {
   return router;
 }
 
-module.exports = { createAdminRouter, adminSessions };
+// ── Standalone handlers for public mounts (used directly in server.js) ──────
+function handleAdminLogin(loadSettings) {
+  return (req, res) => {
+    const { password } = req.body || {};
+    const s = loadSettings();
+    const expectedPassword = (s.adminPassword || '').trim() || 'admin';
+    if (!password || password !== expectedPassword) {
+      return res.status(401).json({ error: 'Invalid password' });
+    }
+    const token = generateAdminToken();
+    adminSessions.set(token, Date.now() + SESSION_TTL_MS);
+    res.json({ token, expiresIn: SESSION_TTL_MS });
+  };
+}
+
+function handleAdminLogout() {
+  return (req, res) => {
+    const token = (req.headers['x-admin-token'] || req.body?.token || '').trim();
+    if (token) adminSessions.delete(token);
+    res.json({ ok: true });
+  };
+}
+
+module.exports = { createAdminRouter, adminSessions, handleAdminLogin, handleAdminLogout };
