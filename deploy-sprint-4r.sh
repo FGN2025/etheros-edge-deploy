@@ -44,7 +44,7 @@ echo -e "  ${GREEN}✓${NC} All 9 route modules deployed"
 echo -e "${YELLOW}▸${NC} Installing better-sqlite3 + any new deps..."
 docker exec etheros-isp-portal-backend sh -c "cd /app && npm install --production 2>&1" || {
   echo -e "  ${YELLOW}⚠${NC}  npm install failed inside container — trying with npm ci fallback..."
-  docker exec etheros-isp-portal-backend sh -c "cd /app && npm install better-sqlite3 stripe @resend/node --save 2>&1"
+  docker exec etheros-isp-portal-backend sh -c "cd /app && npm install better-sqlite3 stripe resend --save 2>&1"
 }
 echo -e "  ${GREEN}✓${NC} Dependencies installed"
 

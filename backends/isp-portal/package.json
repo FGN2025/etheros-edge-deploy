@@ -8,6 +8,6 @@
     "cors": "^2.8.5",
     "stripe": "^14.0.0",
     "better-sqlite3": "^9.4.3",
-    "@resend/node": "^2.0.0"
+    "resend": "^3.0.0"
   }
 }
