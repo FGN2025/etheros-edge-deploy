@@ -24,11 +24,14 @@ function createAdminRouter(helpers) {
   const router = express.Router();
 
   // ── GET /api/settings ─────────────────────────────────────────────────────
+  // SECURITY: never return stripeWebhookSecret or adminPassword to the client
   router.get('/settings', (req, res) => {
     const s = loadSettings();
-    // Mask stripe key before sending to client
+    // Mask stripe key
     if (s.stripeKey) s.stripeKey = s.stripeKey.substring(0, 8) + '••••••••';
-    res.json(s);
+    // Strip secrets that must never leave the server
+    const { stripeWebhookSecret: _wh, adminPassword: _ap, ...safe } = s;
+    res.json(safe);
   });
 
   // ── POST /api/settings ────────────────────────────────────────────────────

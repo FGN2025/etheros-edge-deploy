@@ -1,12 +1,11 @@
 'use strict';
 /**
- * server.js — EtherOS ISP Portal Backend  (Sprint 4R — thin wiring layer)
+ * server.js — EtherOS ISP Portal Backend  (Sprint 4S — hardened)
  *
- * All business logic lives in routes/*.js — this file only:
- *   1. Sets up Express + middleware
- *   2. Defines shared helpers (data dir, settings, Stripe, helpers)
- *   3. Imports + mounts each route module
- *   4. Starts the server
+ * Changes from 4R:
+ *   - requireAdmin middleware applied to all ISP admin routes
+ *   - JSON→SQLite migration forced on startup (not lazy)
+ *   - JSON watchdog removed (terminals.js handles offline sweep via SQLite)
  */
 
 const express = require('express');
@@ -35,10 +34,7 @@ function getPortalDomain() {
   } catch {}
   return (process.env.TENANT_DOMAIN || 'edge.etheros.ai').replace(/\/$/, '');
 }
-
-function portalUrl(p = '') {
-  return `https://${getPortalDomain()}${p}`;
-}
+function portalUrl(p = '') { return `https://${getPortalDomain()}${p}`; }
 
 const EDGE_API = `https://${(process.env.TENANT_DOMAIN || 'edge.etheros.ai').replace(/\/$/, '')}/api`;
 
@@ -51,7 +47,6 @@ function saveSettings(s) {
   fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
 }
-
 function getStripe() {
   const s = loadSettings();
   const key = (s.stripeKey || '').trim();
@@ -62,10 +57,9 @@ function getStripe() {
   } catch { return null; }
 }
 
-// ── Subscriber token helpers (shared with chat + subscribers routes) ───────────
+// ── Subscriber token helpers ──────────────────────────────────────────────────
 function makeToken(subscriberId) {
-  const payload = `${subscriberId}.${Date.now()}`;
-  return Buffer.from(payload).toString('base64url');
+  return Buffer.from(`${subscriberId}.${Date.now()}`).toString('base64url');
 }
 function parseToken(token) {
   try {
@@ -79,67 +73,89 @@ function parseToken(token) {
 
 // ── Shared helpers bundle ─────────────────────────────────────────────────────
 const shared = {
-  DATA_DIR,
-  TENANT_SLUG,
-  EDGE_API,
-  loadSettings,
-  saveSettings,
-  getStripe,
-  portalUrl,
-  getPortalDomain,
-  makeToken,
-  parseToken,
+  DATA_DIR, TENANT_SLUG, EDGE_API,
+  loadSettings, saveSettings, getStripe,
+  portalUrl, getPortalDomain,
+  makeToken, parseToken,
 };
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
+const { createAdminRouter, adminSessions } = require('./routes/admin');
+const { requireAdmin, rateLimiter }        = require('./routes/middleware');
+const auth = requireAdmin(adminSessions, loadSettings);
 
 // ── Route modules ─────────────────────────────────────────────────────────────
 
-// Terminals — /api/terminals/**
+// ── Terminals (/api/terminals/**) — admin protected ──────────────────────────
 const terminalsRouter = require('./routes/terminals')(DATA_DIR);
-app.use('/api/terminals', terminalsRouter);
+app.use('/api/terminals', auth, terminalsRouter);
 
-// Subscribers — /api/subscribers/**
+// ── Subscribers (/api/subscribers/**) ────────────────────────────────────────
+// PUBLIC: /auth  /auth/pin/:id  /me  (terminal kiosk)
+// ADMIN:  everything else
 const subscribersRouter = require('./routes/subscribers')(DATA_DIR, loadSettings, getStripe, portalUrl);
-app.use('/api/subscribers', subscribersRouter);
+app.post('/api/subscribers/auth',        rateLimiter(60_000, 20), subscribersRouter); // PIN login — public, rate-limited
+app.get('/api/subscribers/auth/pin/:id', subscribersRouter);                           // PIN lookup — public
+app.get('/api/subscribers/me',           subscribersRouter);                           // self-read — public
+app.use('/api/subscribers',              auth, subscribersRouter);                     // all else — admin
 
-// Agents — /api/agents/**
+// ── Agents (/api/agents/**) ───────────────────────────────────────────────────
+// PUBLIC: /browse (terminal kiosk fetches available agents)
+// ADMIN:  everything else
 const agentsRouter = require('./routes/agents')(DATA_DIR);
-app.use('/api/agents', agentsRouter);
+app.use('/api/agents/browse', agentsRouter);           // public
+app.use('/api/agents',        auth, agentsRouter);     // admin
 
-// Marketing — /api/marketing/**
+// ── Marketing (/api/marketing/**) — admin protected ──────────────────────────
 const marketingRouter = require('./routes/marketing')(DATA_DIR, loadSettings);
-app.use('/api/marketing', marketingRouter);
+app.use('/api/marketing', auth, marketingRouter);
 
-// Acquisition — /api/acquisition/**
+// ── Acquisition (/api/acquisition/**) ────────────────────────────────────────
+// PUBLIC: /pages/:slug/render  /leads (POST — lead capture form submissions)
+// ADMIN:  /pages CRUD  /leads GET (lead inbox)
 const acquisitionRouter = require('./routes/acquisition')(DATA_DIR, loadSettings);
-app.use('/api/acquisition', acquisitionRouter);
+app.use('/api/acquisition/pages/:slug/render', acquisitionRouter);   // public page render
+app.post('/api/acquisition/leads',             acquisitionRouter);   // public lead capture
+app.use('/api/acquisition',                    auth, acquisitionRouter); // admin CRUD
 
-// Billing — /api/billing/**
+// ── Billing (/api/billing/**) ─────────────────────────────────────────────────
+// PUBLIC: /webhook (Stripe — verified by signature)  /plans
+// ADMIN:  everything else
 const billingRouter = require('./routes/billing')(DATA_DIR, loadSettings, getStripe, portalUrl);
-app.use('/api/billing', billingRouter);
+app.use('/api/billing/webhook', billingRouter);                  // public — Stripe webhook
+app.use('/api/billing/plans',   billingRouter);                  // public — pricing page
+app.use('/api/billing',         auth, billingRouter);            // admin
 
-// Dashboard — /api/dashboard, /api/server-stats, /api/revenue
+// ── Dashboard (/api/dashboard  /api/server-stats  /api/revenue) — admin ──────
 const { createDashboardRouter } = require('./routes/dashboard');
-const dashboardRouter = createDashboardRouter(shared);
-app.use('/api', dashboardRouter);
+app.use('/api', auth, createDashboardRouter(shared));
 
-// Chat — /api/chat/stream
+// ── Chat (/api/chat/stream) — subscriber token auth (handled inside router) ──
 const { createChatRouter } = require('./routes/chat');
-const chatRouter = createChatRouter(shared);
-app.use('/api', chatRouter);
+app.use('/api', createChatRouter(shared));
 
-// Admin — /api/settings, /api/admin/*, /api/edge-*, /api/isp-config,
-//          /api/terminal/config, /api/tenant, /api/services/**
-const { createAdminRouter } = require('./routes/admin');
+// ── Admin router ─────────────────────────────────────────────────────────────
 const adminRouter = createAdminRouter(shared);
-app.use('/api', adminRouter);
 
-// Health — mounted at root (no /api prefix)
+// PUBLIC — terminal kiosk reads these on boot (must be registered BEFORE auth catch-all)
+app.get('/api/tenant',          adminRouter);
+app.get('/api/terminal/config', adminRouter);
+app.get('/api/isp-config',      adminRouter);
+
+// PUBLIC — login/logout (can't require auth to log in)
+app.post('/api/admin/login',  rateLimiter(60_000, 10), adminRouter);
+app.post('/api/admin/logout', adminRouter);
+
+// PROTECTED — all remaining /api/* admin routes
+app.use('/api', auth, adminRouter);
+
+// ── Health — public, no auth ──────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const s = loadSettings();
   res.json({
     status: 'ok',
     service: 'isp-portal-backend',
-    version: '2.0.0-multitenant',
+    version: '2.0.0-4s',
     tenant: TENANT_SLUG || 'default',
     ispName: s.ispName || null,
     domain: s.domain || getPortalDomain(),
@@ -147,35 +163,28 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── Terminal offline watchdog ─────────────────────────────────────────────────
-// Mark terminals offline after 3 min without a heartbeat
-const TERMINALS_FILE = `${DATA_DIR}/terminals.json`;
-function loadJSON(file, fallback = []) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch { return fallback; }
-}
-function saveJSON(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-setInterval(() => {
+// ── Startup: force JSON→SQLite migration ─────────────────────────────────────
+(function runMigration() {
   try {
-    const terminals = loadJSON(TERMINALS_FILE);
-    const now = Date.now();
-    let changed = false;
-    terminals.forEach(t => {
-      if (t.status === 'online' && t.lastSeen) {
-        const age = now - new Date(t.lastSeen).getTime();
-        if (age > 3 * 60 * 1000) { t.status = 'offline'; changed = true; }
-      }
-    });
-    if (changed) saveJSON(TERMINALS_FILE, terminals);
-  } catch {}
-}, 60 * 1000);
+    const { getDb, migrateFromJson } = require('./db');
+    const db = getDb(DATA_DIR);
+    if (!db) {
+      console.log('[migration] better-sqlite3 not available — running in JSON shim mode');
+      return;
+    }
+    const result = migrateFromJson(db, DATA_DIR);
+    if (result.skipped) {
+      console.log('[migration] already migrated — skipping');
+    } else {
+      console.log('[migration] JSON→SQLite complete:', JSON.stringify(result));
+    }
+  } catch (err) {
+    console.error('[migration] failed (non-fatal):', err.message);
+  }
+})();
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3010;
 app.listen(PORT, () => {
-  console.log(`[isp-portal] listening on :${PORT}  tenant=${TENANT_SLUG || 'default'}`);
+  console.log(`[isp-portal] listening on :${PORT}  tenant=${TENANT_SLUG || 'default'}  version=4S`);
 });

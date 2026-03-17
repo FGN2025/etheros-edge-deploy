@@ -131,11 +131,13 @@ module.exports = function billingRouter(DATA_DIR, loadSettings, getStripe, porta
     const stripe = getStripe();
     if (!stripe) return res.status(400).json({ error: 'Stripe not configured' });
     const settings = loadSettings();
-    const sig = req.headers['stripe-signature'];
+    const sig    = req.headers['stripe-signature'];
     const secret = settings.stripeWebhookSecret?.trim();
+    if (!secret) return res.status(400).json({ error: 'Webhook secret not configured — add stripeWebhookSecret in Settings' });
+    if (!sig)    return res.status(400).json({ error: 'Missing stripe-signature header' });
     let event;
     try {
-      event = secret ? stripe.webhooks.constructEvent(req.body, sig, secret) : JSON.parse(req.body.toString());
+      event = stripe.webhooks.constructEvent(req.body, sig, secret);
     } catch { return res.status(400).json({ error: 'Webhook signature verification failed' }); }
     try {
       const d = db();
