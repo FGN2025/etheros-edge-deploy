@@ -1518,18 +1518,191 @@ app.delete('/api/subscribers/:id/agents/:agentId', (req, res) => {
 
 // ── Dashboard KPIs ──────────────────────────────────────────────────────────
 app.get('/api/dashboard', (req, res) => {
-  const terminals = loadJSON(TERMINALS_FILE);
+  const terminals  = loadJSON(TERMINALS_FILE);
   const subscribers = loadJSON(SUBSCRIBERS_FILE);
-  const online = terminals.filter(t => t.status === 'online').length;
-  const offline = terminals.filter(t => t.status === 'offline').length;
+  const agents     = loadAgents();
+  const revenue    = loadRevenue();
+
+  // ── Terminal stats ────────────────────────────────────────────────────────
+  const online       = terminals.filter(t => t.status === 'online').length;
+  const offline      = terminals.filter(t => t.status === 'offline').length;
   const provisioning = terminals.filter(t => t.status === 'provisioning').length;
-  const activeSubs = subscribers.filter(s => s.status === 'active');
+
+  // ── Subscriber stats ──────────────────────────────────────────────────────
+  const activeSubs   = subscribers.filter(s => s.status === 'active');
+  const inactiveSubs = subscribers.filter(s => s.status !== 'active');
   const monthlyRevenue = activeSubs.reduce((sum, s) => sum + (s.monthlySpend || 0), 0);
-  const arpu = activeSubs.length > 0 ? Math.round(monthlyRevenue / activeSubs.length) : 0;
-  res.json({ totalTerminals: terminals.length, online, offline, provisioning,
-    activeSubscribers: activeSubs.length, monthlyRevenue,
-    prevMonthlyRevenue: Math.round(monthlyRevenue * 0.95),
-    arpu, revenueByMonth: [], activity: [] });
+  const arpu = activeSubs.length > 0 ? (monthlyRevenue / activeSubs.length) : 0;
+
+  // Plan distribution
+  const planCounts = { personal: 0, professional: 0, charter: 0 };
+  activeSubs.forEach(s => { if (planCounts[s.plan] !== undefined) planCounts[s.plan]++; });
+
+  // Billing status breakdown
+  const billingCounts = {};
+  subscribers.forEach(s => {
+    const status = s.billingStatus || 'invited';
+    billingCounts[status] = (billingCounts[status] || 0) + 1;
+  });
+
+  // ISP breakdown — top 10 by subscriber count
+  const ispMap = {};
+  subscribers.forEach(s => {
+    if (!s.isp) return;
+    if (!ispMap[s.isp]) ispMap[s.isp] = { name: s.isp, subscribers: 0, revenue: 0 };
+    ispMap[s.isp].subscribers++;
+    if (s.status === 'active') ispMap[s.isp].revenue += (s.monthlySpend || 0);
+  });
+  const topIsps = Object.values(ispMap)
+    .sort((a, b) => b.subscribers - a.subscribers)
+    .slice(0, 10);
+
+  // Agent leaderboard — by activationCount
+  const topAgents = agents
+    .filter(a => a.isEnabled)
+    .sort((a, b) => (b.activationCount || 0) - (a.activationCount || 0))
+    .slice(0, 8)
+    .map(a => ({ id: a.id, name: a.name, category: a.category, activationCount: a.activationCount || 0, pricingType: a.pricingType }));
+
+  // Agent category distribution
+  const categoryMap = {};
+  agents.filter(a => a.isEnabled).forEach(a => {
+    categoryMap[a.category] = (categoryMap[a.category] || 0) + 1;
+  });
+  const agentCategories = Object.entries(categoryMap).map(([name, count]) => ({ name, count }));
+
+  // Subscriber join trend — last 6 months
+  const now = new Date();
+  const joinTrend = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const label = d.toLocaleString('en-US', { month: 'short', year: '2-digit' });
+    const count = subscribers.filter(s => {
+      if (!s.joinedAt) return false;
+      const j = new Date(s.joinedAt);
+      return j.getFullYear() === d.getFullYear() && j.getMonth() === d.getMonth();
+    }).length;
+    joinTrend.push({ month: label, subscribers: count });
+  }
+
+  // Churn signals — invited >30 days, past_due
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const stalledInvites = subscribers.filter(s =>
+    s.billingStatus === 'invited' &&
+    s.billingInvitedAt &&
+    new Date(s.billingInvitedAt).getTime() < thirtyDaysAgo
+  ).length;
+  const pastDue = subscribers.filter(s => s.billingStatus === 'past_due').length;
+  const cancelPending = subscribers.filter(s => s.cancelAtPeriodEnd).length;
+
+  // Revenue history (last 6 months)
+  const revenueByMonth = revenue.slice(-6);
+  const prevMonthlyRevenue = revenueByMonth.length >= 2
+    ? revenueByMonth[revenueByMonth.length - 2].totalRevenue
+    : Math.round(monthlyRevenue * 0.95);
+
+  // Recent activity stub (terminals last seen)
+  const recentTerminals = [...terminals]
+    .filter(t => t.lastSeen)
+    .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen))
+    .slice(0, 5)
+    .map(t => ({
+      id: t.id,
+      type: 'terminal',
+      message: `${t.hostname || t.id} — ${t.status}`,
+      timestamp: t.lastSeen,
+    }));
+
+  res.json({
+    // Core KPIs
+    totalTerminals: terminals.length,
+    online, offline, provisioning,
+    activeSubscribers: activeSubs.length,
+    totalSubscribers: subscribers.length,
+    monthlyRevenue,
+    prevMonthlyRevenue,
+    arpu,
+    // Plan distribution
+    planDistribution: [
+      { name: 'Personal',     value: planCounts.personal,     color: '#00C2CB' },
+      { name: 'Professional', value: planCounts.professional, color: '#00A8B0' },
+      { name: 'Charter',      value: planCounts.charter,      color: '#007A80' },
+    ],
+    // Billing health
+    billingCounts,
+    stalledInvites,
+    pastDue,
+    cancelPending,
+    // ISPs
+    topIsps,
+    // Agents
+    topAgents,
+    agentCategories,
+    totalAgents: agents.filter(a => a.isEnabled).length,
+    // Trends
+    joinTrend,
+    revenueByMonth,
+    // Activity
+    activity: recentTerminals,
+  });
+});
+
+// ── GET /api/server-stats — VPS resource metrics ──────────────────────────────
+app.get('/api/server-stats', (req, res) => {
+  const osLib = require('os');
+  const totalMem = osLib.totalmem();
+  const freeMem  = osLib.freemem();
+  const usedMem  = totalMem - freeMem;
+  const cpus     = osLib.cpus();
+
+  // CPU usage — average over all cores using idle vs total ticks
+  const cpuUsage = cpus.map(cpu => {
+    const times  = cpu.times;
+    const total  = Object.values(times).reduce((a, b) => a + b, 0);
+    const idle   = times.idle;
+    return total > 0 ? Math.round(((total - idle) / total) * 100) : 0;
+  });
+  const avgCpu = cpuUsage.length > 0
+    ? Math.round(cpuUsage.reduce((a, b) => a + b, 0) / cpuUsage.length)
+    : 0;
+
+  // Uptime
+  const uptimeSecs = osLib.uptime();
+  const uptimeDays  = Math.floor(uptimeSecs / 86400);
+  const uptimeHours = Math.floor((uptimeSecs % 86400) / 3600);
+  const uptimeStr   = uptimeDays > 0 ? `${uptimeDays}d ${uptimeHours}h` : `${uptimeHours}h`;
+
+  // Load average
+  const load = osLib.loadavg();
+
+  // Process memory
+  const procMem = process.memoryUsage();
+
+  res.json({
+    cpu: {
+      cores: cpus.length,
+      model: cpus[0]?.model || 'Unknown',
+      usagePercent: avgCpu,
+      perCore: cpuUsage,
+      loadAvg: load.map(l => Math.round(l * 100) / 100),
+    },
+    memory: {
+      totalGb:  Math.round((totalMem / 1073741824) * 10) / 10,
+      usedGb:   Math.round((usedMem  / 1073741824) * 10) / 10,
+      freeGb:   Math.round((freeMem  / 1073741824) * 10) / 10,
+      usedPercent: Math.round((usedMem / totalMem) * 100),
+    },
+    process: {
+      heapUsedMb:  Math.round(procMem.heapUsed  / 1048576),
+      heapTotalMb: Math.round(procMem.heapTotal / 1048576),
+      rssMb:       Math.round(procMem.rss       / 1048576),
+    },
+    uptime: uptimeStr,
+    uptimeSecs,
+    platform: osLib.platform(),
+    nodeVersion: process.version,
+    ts: new Date().toISOString(),
+  });
 });
 
 
