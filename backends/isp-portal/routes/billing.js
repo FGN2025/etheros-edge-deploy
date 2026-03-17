@@ -49,14 +49,16 @@ module.exports = function billingRouter(DATA_DIR, loadSettings, getStripe, porta
 
   router.get('/', async (req, res) => {
     const stripe = getStripe();
-    if (!stripe) return res.json({ ...bs(), status:'none', customerId:null, invoices:[] });
+    const s = loadSettings();
+    const hasStripeKey = !!(s.stripeKey || '').trim();
+    if (!stripe) return res.json({ ...bs(), status:'none', customerId:null, invoices:[], hasStripeKey });
     try {
       const state = bs();
       const d = db();
       if (state.subscriptionId) await syncSubscription(d, stripe, state.subscriptionId);
       const fresh = bs();
       const invoices = fresh.customerId ? await fetchInvoices(stripe, fresh.customerId) : [];
-      res.json({ ...fresh, invoices });
+      res.json({ ...fresh, invoices, hasStripeKey: true });
     } catch (err) { res.status(500).json({ error: String(err) }); }
   });
 
