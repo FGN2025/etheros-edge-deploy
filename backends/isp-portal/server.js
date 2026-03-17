@@ -2566,4 +2566,163 @@ app.delete('/api/marketing/pages/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// ════════════════════════════════════════════════════════════════════════════════
+// Sprint 4K — ISP Acquisition Tools
+//
+//  Landing Pages  → GET/POST/PATCH/DELETE /api/acquisition/pages
+//  Public view    → GET /pages/:slug  (served by nginx → /api/acquisition/pages/:slug/render)
+//  Lead capture   → POST /api/acquisition/leads
+//  Lead inbox     → GET  /api/acquisition/leads
+//  Resend notify  → fires on lead submit if RESEND_API_KEY set in settings
+// ════════════════════════════════════════════════════════════════════════════════
+
+const ACQ_PAGES_FILE = `${DATA_DIR}/acquisition-pages.json`;
+const ACQ_LEADS_FILE = `${DATA_DIR}/acquisition-leads.json`;
+
+function loadAcqPages()  { try { return JSON.parse(fs.readFileSync(ACQ_PAGES_FILE, 'utf8')); } catch { return []; } }
+function saveAcqPages(d) { fs.mkdirSync(path.dirname(ACQ_PAGES_FILE), { recursive: true }); fs.writeFileSync(ACQ_PAGES_FILE, JSON.stringify(d, null, 2)); }
+function loadAcqLeads()  { try { return JSON.parse(fs.readFileSync(ACQ_LEADS_FILE, 'utf8')); } catch { return []; } }
+function saveAcqLeads(d) { fs.mkdirSync(path.dirname(ACQ_LEADS_FILE), { recursive: true }); fs.writeFileSync(ACQ_LEADS_FILE, JSON.stringify(d, null, 2)); }
+function acqId()         { return require('crypto').randomUUID(); }
+
+// Send notification via Resend
+async function sendLeadNotification(lead, page) {
+  const s = loadSettings();
+  const apiKey = (s.resendApiKey || '').trim();
+  const notifyEmail = (s.resendFromEmail || s.contactEmail || 'darcy@motoworlds.com').trim();
+  if (!apiKey) return { ok: false, reason: 'no_resend_key' };
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'EtherOS Leads <noreply@etheros.ai>',
+        to: [notifyEmail],
+        subject: `New lead from ${page?.title || lead.pageSlug}: ${lead.name}`,
+        html: `
+          <div style="font-family:sans-serif;max-width:560px;margin:0 auto">
+            <h2 style="color:#00C2CB">New EtherOS Lead</h2>
+            <table style="width:100%;border-collapse:collapse">
+              <tr><td style="padding:6px 0;color:#666">Name</td><td style="padding:6px 0;font-weight:600">${lead.name}</td></tr>
+              <tr><td style="padding:6px 0;color:#666">Email</td><td style="padding:6px 0">${lead.email}</td></tr>
+              ${lead.phone ? `<tr><td style="padding:6px 0;color:#666">Phone</td><td style="padding:6px 0">${lead.phone}</td></tr>` : ''}
+              ${lead.company ? `<tr><td style="padding:6px 0;color:#666">Company</td><td style="padding:6px 0">${lead.company}</td></tr>` : ''}
+              ${lead.message ? `<tr><td style="padding:6px 0;color:#666">Message</td><td style="padding:6px 0">${lead.message}</td></tr>` : ''}
+              <tr><td style="padding:6px 0;color:#666">Page</td><td style="padding:6px 0">${page?.title || lead.pageSlug} (/${lead.pageSlug})</td></tr>
+              <tr><td style="padding:6px 0;color:#666">Type</td><td style="padding:6px 0">${lead.leadType || 'general'}</td></tr>
+              <tr><td style="padding:6px 0;color:#666">Time</td><td style="padding:6px 0">${new Date(lead.createdAt).toLocaleString()}</td></tr>
+            </table>
+            <p style="margin-top:20px"><a href="https://edge.etheros.ai/#/acquisition" style="background:#00C2CB;color:#0a1929;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600">View All Leads</a></p>
+          </div>`,
+      }),
+    });
+    const data = await res.json();
+    return { ok: res.ok, data };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+// ── GET /api/acquisition/pages ────────────────────────────────────────────────
+app.get('/api/acquisition/pages', (req, res) => {
+  res.json(loadAcqPages());
+});
+
+// ── GET /api/acquisition/pages/:slug/render  (public — no auth) ──────────────
+app.get('/api/acquisition/pages/:slug/render', (req, res) => {
+  const pages = loadAcqPages();
+  const page = pages.find(p => p.slug === req.params.slug && p.published);
+  if (!page) return res.status(404).json({ error: 'Page not found or not published' });
+  // Increment view count
+  page.views = (page.views || 0) + 1;
+  saveAcqPages(pages);
+  res.json(page);
+});
+
+// ── POST /api/acquisition/pages ───────────────────────────────────────────────
+app.post('/api/acquisition/pages', (req, res) => {
+  const { title, slug, template, pageType, content, published } = req.body;
+  if (!title || !slug) return res.status(400).json({ error: 'title and slug required' });
+  const pages = loadAcqPages();
+  if (pages.find(p => p.slug === slug)) return res.status(409).json({ error: 'Slug already exists' });
+  const page = {
+    id: acqId(), title, slug, template: template || 'isp-recruit', pageType: pageType || 'isp',
+    content: content || {}, published: published || false,
+    views: 0, leads: 0,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  pages.push(page);
+  saveAcqPages(pages);
+  res.status(201).json(page);
+});
+
+// ── PATCH /api/acquisition/pages/:id ─────────────────────────────────────────
+app.patch('/api/acquisition/pages/:id', (req, res) => {
+  const pages = loadAcqPages();
+  const idx = pages.findIndex(p => p.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  const existing = pages[idx];
+  // Slug uniqueness check if changing slug
+  if (req.body.slug && req.body.slug !== existing.slug) {
+    if (pages.find(p => p.slug === req.body.slug)) return res.status(409).json({ error: 'Slug already exists' });
+  }
+  pages[idx] = { ...existing, ...req.body, id: existing.id, updatedAt: new Date().toISOString() };
+  saveAcqPages(pages);
+  res.json(pages[idx]);
+});
+
+// ── DELETE /api/acquisition/pages/:id ────────────────────────────────────────
+app.delete('/api/acquisition/pages/:id', (req, res) => {
+  const pages = loadAcqPages();
+  const idx = pages.findIndex(p => p.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  pages.splice(idx, 1);
+  saveAcqPages(pages);
+  res.json({ ok: true });
+});
+
+// ── POST /api/acquisition/leads  (public — no auth) ──────────────────────────
+app.post('/api/acquisition/leads', async (req, res) => {
+  const { name, email, phone, company, message, pageSlug, leadType } = req.body;
+  if (!name || !email || !pageSlug) return res.status(400).json({ error: 'name, email, pageSlug required' });
+  const leads = loadAcqLeads();
+  const lead = {
+    id: acqId(), name, email,
+    phone: phone || '', company: company || '', message: message || '',
+    pageSlug, leadType: leadType || 'general',
+    status: 'new', createdAt: new Date().toISOString(),
+  };
+  leads.unshift(lead);
+  saveAcqLeads(leads);
+  // Increment lead count on page
+  const pages = loadAcqPages();
+  const pageIdx = pages.findIndex(p => p.slug === pageSlug);
+  if (pageIdx >= 0) { pages[pageIdx].leads = (pages[pageIdx].leads || 0) + 1; saveAcqPages(pages); }
+  // Notify via Resend (fire-and-forget)
+  const page = pages[pageIdx] || null;
+  sendLeadNotification(lead, page).catch(() => {});
+  res.status(201).json({ ok: true, id: lead.id });
+});
+
+// ── GET /api/acquisition/leads ────────────────────────────────────────────────
+app.get('/api/acquisition/leads', (req, res) => {
+  const leads = loadAcqLeads();
+  const { pageSlug, status, limit } = req.query;
+  let filtered = leads;
+  if (pageSlug) filtered = filtered.filter(l => l.pageSlug === pageSlug);
+  if (status)   filtered = filtered.filter(l => l.status === status);
+  if (limit)    filtered = filtered.slice(0, parseInt(limit));
+  res.json(filtered);
+});
+
+// ── PATCH /api/acquisition/leads/:id  (update status) ────────────────────────
+app.patch('/api/acquisition/leads/:id', (req, res) => {
+  const leads = loadAcqLeads();
+  const idx = leads.findIndex(l => l.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Not found' });
+  leads[idx] = { ...leads[idx], ...req.body, id: leads[idx].id };
+  saveAcqLeads(leads);
+  res.json(leads[idx]);
+});
+
 // ── End Sprint 4I ─────────────────────────────────────────────────────────────
