@@ -34,6 +34,133 @@ module.exports = function subscribersRouter(DATA_DIR, loadSettings, getStripe, p
   const router = Router();
   function db() { return getDb(DATA_DIR); }
 
+  // ── Self-signup (public) — creates subscriber + optional Stripe Checkout ───
+  // POST /api/subscribers/signup
+  // Body: { name, email, plan, successUrl?, cancelUrl? }
+  // - If plan has priceId and Stripe is configured → returns { checkoutUrl }
+  // - If plan is free (price_monthly=0) or no Stripe → creates subscriber directly
+  router.post('/signup', async (req, res) => {
+    const { name, email, plan = 'personal', successUrl, cancelUrl } = req.body || {};
+    if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
+    if (!SUBSCRIBER_PLANS[plan]) return res.status(400).json({ error: `Unknown plan: ${plan}` });
+    const d = db();
+    const existing = d.prepare('SELECT id FROM subscribers WHERE email=?').get(email);
+    if (existing) return res.status(409).json({ error: 'An account with this email already exists' });
+    const planInfo = SUBSCRIBER_PLANS[plan];
+    const stripe = getStripe();
+    // If paid plan and Stripe is configured, send to Stripe Checkout
+    if (planInfo.priceMonthly > 0 && stripe) {
+      try {
+        const sub = {
+          id: randomUUID(), name, email, plan, status: 'active',
+          agents_active: 0, monthly_spend: PLAN_PRICES[plan] || 0,
+          joined_at: new Date().toISOString(), isp: null,
+          stripe_customer_id: null, stripe_subscription_id: null,
+          stripe_checkout_session_id: null, billing_status: 'none',
+          billing_invited_at: null, current_period_end: null,
+          cancel_at_period_end: 0, active_agent_ids: '[]',
+        };
+        d.prepare(`INSERT INTO subscribers
+          (id,name,email,plan,status,agents_active,monthly_spend,joined_at,isp,
+           stripe_customer_id,stripe_subscription_id,stripe_checkout_session_id,
+           billing_status,billing_invited_at,current_period_end,cancel_at_period_end,active_agent_ids)
+          VALUES (@id,@name,@email,@plan,@status,@agents_active,@monthly_spend,@joined_at,@isp,
+                  @stripe_customer_id,@stripe_subscription_id,@stripe_checkout_session_id,
+                  @billing_status,@billing_invited_at,@current_period_end,@cancel_at_period_end,@active_agent_ids)
+        `).run(sub);
+        const session = await stripe.checkout.sessions.create({
+          mode: 'subscription',
+          line_items: [{ price: planInfo.priceId, quantity: 1 }],
+          customer_email: email,
+          success_url: successUrl || portalUrl(`/isp-portal/#/terminal?billing=success&session_id={CHECKOUT_SESSION_ID}`),
+          cancel_url: cancelUrl || portalUrl(`/isp-portal/#/subscribe?billing=canceled`),
+          metadata: { subscriberId: sub.id, plan, subscriberName: name },
+        });
+        d.prepare('UPDATE subscribers SET stripe_checkout_session_id=?,billing_status=? WHERE id=?')
+          .run(session.id, 'invited', sub.id);
+        const created = subscriberFromRow(d.prepare('SELECT * FROM subscribers WHERE id=?').get(sub.id));
+        return res.status(201).json({
+          ok: true, requiresCheckout: true,
+          checkoutUrl: session.url,
+          subscriberId: sub.id,
+          subscriber: created,
+        });
+      } catch (err) { return res.status(500).json({ error: err.message }); }
+    }
+    // Free plan or no Stripe — create subscriber directly and return PIN
+    const sub = {
+      id: randomUUID(), name, email, plan, status: 'active',
+      agents_active: 0, monthly_spend: 0,
+      joined_at: new Date().toISOString(), isp: null,
+      stripe_customer_id: null, stripe_subscription_id: null,
+      stripe_checkout_session_id: null, billing_status: 'none',
+      billing_invited_at: null, current_period_end: null,
+      cancel_at_period_end: 0, active_agent_ids: '[]',
+    };
+    d.prepare(`INSERT INTO subscribers
+      (id,name,email,plan,status,agents_active,monthly_spend,joined_at,isp,
+       stripe_customer_id,stripe_subscription_id,stripe_checkout_session_id,
+       billing_status,billing_invited_at,current_period_end,cancel_at_period_end,active_agent_ids)
+      VALUES (@id,@name,@email,@plan,@status,@agents_active,@monthly_spend,@joined_at,@isp,
+              @stripe_customer_id,@stripe_subscription_id,@stripe_checkout_session_id,
+              @billing_status,@billing_invited_at,@current_period_end,@cancel_at_period_end,@active_agent_ids)
+    `).run(sub);
+    const created = subscriberFromRow(d.prepare('SELECT * FROM subscribers WHERE id=?').get(sub.id));
+    return res.status(201).json({
+      ok: true, requiresCheckout: false,
+      subscriberId: sub.id,
+      pin: subscriberPin(created),
+      subscriber: created,
+    });
+  });
+
+  // ── Subscriber billing summary (Bearer token auth) ────────────────────────
+  // GET /api/subscribers/:id/billing-summary
+  // Returns current plan, billing status, period end, Stripe portal URL, plans list
+  router.get('/:id/billing-summary', async (req, res) => {
+    const auth = (req.headers.authorization || '').replace('Bearer ', '');
+    const tokenId = parseToken(auth);
+    if (!tokenId || tokenId !== req.params.id) {
+      return res.status(401).json({ error: 'Invalid or expired session' });
+    }
+    const d = db();
+    const row = d.prepare('SELECT * FROM subscribers WHERE id=?').get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Subscriber not found' });
+    const sub = subscriberFromRow(row);
+    const planInfo = SUBSCRIBER_PLANS[sub.plan] || SUBSCRIBER_PLANS.personal;
+    const allPlans = Object.entries(SUBSCRIBER_PLANS).map(([id, p]) => ({
+      id, name: p.name, priceMonthly: p.priceMonthly,
+      current: id === sub.plan,
+    }));
+    // Try to get a Stripe portal URL if subscriber has a customer ID
+    let portalUrlStr = null;
+    const stripe = getStripe();
+    if (stripe && sub.stripeCustomerId) {
+      try {
+        const session = await stripe.billingPortal.sessions.create({
+          customer: sub.stripeCustomerId,
+          return_url: portalUrl('/isp-portal/#/terminal'),
+        });
+        portalUrlStr = session.url;
+      } catch { /* non-fatal */ }
+    }
+    res.json({
+      subscriberId: sub.id,
+      name: sub.name,
+      email: sub.email,
+      plan: sub.plan,
+      planName: planInfo.name,
+      priceMonthly: planInfo.priceMonthly,
+      billingStatus: sub.billingStatus,
+      currentPeriodEnd: sub.currentPeriodEnd,
+      cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+      stripeCustomerId: sub.stripeCustomerId,
+      hasActiveSubscription: sub.billingStatus === 'active',
+      plans: allPlans,
+      stripePortalUrl: portalUrlStr,
+    });
+  });
+
   // ── PIN auth (terminal-facing, public) ────────────────────────────────────
   router.post('/auth', (req, res) => {
     const { pin } = req.body || {};
@@ -324,6 +451,18 @@ module.exports = function subscribersRouter(DATA_DIR, loadSettings, getStripe, p
     if (!agentRow) return res.status(404).json({ error: 'Agent not found' });
     if (!agentRow.is_enabled) return res.status(403).json({ error: 'Agent is not enabled by ISP' });
     const sub = subscriberFromRow(subRow);
+    // ── Billing gate: addon agents require an active paid subscription ─────────
+    const isAddon = agentRow.pricing_type === 'addon' || agentRow.price_monthly > 0;
+    if (isAddon && sub.billingStatus !== 'active') {
+      return res.status(402).json({
+        error: 'An active subscription is required to activate premium agents',
+        requiresBilling: true,
+        agentId: req.params.agentId,
+        agentName: agentRow.name,
+        priceMonthly: agentRow.price_monthly,
+      });
+    }
+    // ── Plan slot limit ────────────────────────────────────────────────────────
     const limit = PLAN_AGENT_LIMITS[sub.plan] || 3;
     const activeIds = sub.activeAgentIds;
     if (activeIds.includes(req.params.agentId)) return res.status(409).json({ error: 'Agent already active for this subscriber' });

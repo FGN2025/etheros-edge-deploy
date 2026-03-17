@@ -167,6 +167,99 @@ app.get('/api/services/blacknut/status', async (req, res) => {
   } catch (err) { res.json({ enabled: true, status: 'error', error: String(err) }); }
 });
 
+// Subscriber self-signup (public) — inline to avoid path stripping
+app.post('/api/subscribers/signup', rateLimiter(60_000, 10), async (req, res) => {
+  const { name, email, plan = 'personal', successUrl, cancelUrl } = req.body || {};
+  if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
+  const SUBSCRIBER_PLANS = {
+    personal:     { name: 'Personal',     priceMonthly: 1499, priceId: 'price_1TBPB5ERnCKuXiJaJSsWJBTw' },
+    professional: { name: 'Professional', priceMonthly: 3999, priceId: 'price_1TBPCzERnCKuXiJagZEPZAVk' },
+    charter:      { name: 'Charter',      priceMonthly: 9999, priceId: 'price_1TBPCzERnCKuXiJaB8DWJ84N' },
+  };
+  if (!SUBSCRIBER_PLANS[plan]) return res.status(400).json({ error: `Unknown plan: ${plan}` });
+  const { getDb, subscriberFromRow } = require('./db');
+  const { randomUUID, createHash } = require('crypto');
+  const db = getDb(DATA_DIR);
+  const existing = db.prepare('SELECT id FROM subscribers WHERE email=?').get(email);
+  if (existing) return res.status(409).json({ error: 'An account with this email already exists' });
+  const planInfo = SUBSCRIBER_PLANS[plan];
+  const stripe = getStripe();
+  function subscriberPin(sub) {
+    return createHash('sha256').update(sub.id + sub.email).digest('hex').slice(-6).toUpperCase();
+  }
+  const subId = randomUUID();
+  const sub = {
+    id: subId, name, email, plan, status: 'active',
+    agents_active: 0, monthly_spend: planInfo.priceMonthly / 100,
+    joined_at: new Date().toISOString(), isp: null,
+    stripe_customer_id: null, stripe_subscription_id: null,
+    stripe_checkout_session_id: null, billing_status: 'none',
+    billing_invited_at: null, current_period_end: null,
+    cancel_at_period_end: 0, active_agent_ids: '[]',
+  };
+  db.prepare(`INSERT INTO subscribers
+    (id,name,email,plan,status,agents_active,monthly_spend,joined_at,isp,
+     stripe_customer_id,stripe_subscription_id,stripe_checkout_session_id,
+     billing_status,billing_invited_at,current_period_end,cancel_at_period_end,active_agent_ids)
+    VALUES (@id,@name,@email,@plan,@status,@agents_active,@monthly_spend,@joined_at,@isp,
+            @stripe_customer_id,@stripe_subscription_id,@stripe_checkout_session_id,
+            @billing_status,@billing_invited_at,@current_period_end,@cancel_at_period_end,@active_agent_ids)
+  `).run(sub);
+  if (planInfo.priceMonthly > 0 && stripe) {
+    try {
+      const session = await stripe.checkout.sessions.create({
+        mode: 'subscription',
+        line_items: [{ price: planInfo.priceId, quantity: 1 }],
+        customer_email: email,
+        success_url: successUrl || portalUrl(`/isp-portal/#/terminal?billing=success&session_id={CHECKOUT_SESSION_ID}`),
+        cancel_url: cancelUrl || portalUrl(`/isp-portal/#/subscribe?billing=canceled`),
+        metadata: { subscriberId: subId, plan, subscriberName: name },
+      });
+      db.prepare('UPDATE subscribers SET stripe_checkout_session_id=?,billing_status=? WHERE id=?')
+        .run(session.id, 'invited', subId);
+      const created = subscriberFromRow(db.prepare('SELECT * FROM subscribers WHERE id=?').get(subId));
+      return res.status(201).json({ ok: true, requiresCheckout: true, checkoutUrl: session.url, subscriberId: subId, subscriber: created });
+    } catch (err) { return res.status(500).json({ error: err.message }); }
+  }
+  const created = subscriberFromRow(db.prepare('SELECT * FROM subscribers WHERE id=?').get(subId));
+  return res.status(201).json({ ok: true, requiresCheckout: false, subscriberId: subId, pin: subscriberPin(created), subscriber: created });
+});
+
+// Subscriber billing summary (Bearer token — subscriber self-service)
+app.get('/api/subscribers/:id/billing-summary', async (req, res) => {
+  const auth = (req.headers.authorization || '').replace('Bearer ', '');
+  const id = parseToken(auth);
+  if (!id || id !== req.params.id) return res.status(401).json({ error: 'Invalid or expired session' });
+  const { getDb, subscriberFromRow } = require('./db');
+  const db = getDb(DATA_DIR);
+  const row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Subscriber not found' });
+  const sub = subscriberFromRow(row);
+  const SUBSCRIBER_PLANS = {
+    personal:     { name: 'Personal',     priceMonthly: 1499 },
+    professional: { name: 'Professional', priceMonthly: 3999 },
+    charter:      { name: 'Charter',      priceMonthly: 9999 },
+  };
+  const planInfo = SUBSCRIBER_PLANS[sub.plan] || SUBSCRIBER_PLANS.personal;
+  const allPlans = Object.entries(SUBSCRIBER_PLANS).map(([pid, p]) => ({ id: pid, name: p.name, priceMonthly: p.priceMonthly, current: pid === sub.plan }));
+  let stripePortalUrl = null;
+  const stripe = getStripe();
+  if (stripe && sub.stripeCustomerId) {
+    try {
+      const session = await stripe.billingPortal.sessions.create({ customer: sub.stripeCustomerId, return_url: portalUrl('/isp-portal/#/terminal') });
+      stripePortalUrl = session.url;
+    } catch { /* non-fatal */ }
+  }
+  res.json({
+    subscriberId: sub.id, name: sub.name, email: sub.email,
+    plan: sub.plan, planName: planInfo.name, priceMonthly: planInfo.priceMonthly,
+    billingStatus: sub.billingStatus, currentPeriodEnd: sub.currentPeriodEnd,
+    cancelAtPeriodEnd: sub.cancelAtPeriodEnd, stripeCustomerId: sub.stripeCustomerId,
+    hasActiveSubscription: sub.billingStatus === 'active',
+    plans: allPlans, stripePortalUrl,
+  });
+});
+
 // Subscriber PIN auth (terminal login) — rate limited, inline to avoid path stripping
 app.post('/api/subscribers/auth', rateLimiter(60_000, 20), (req, res) => {
   const { pin } = req.body || {};
