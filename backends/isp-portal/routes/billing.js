@@ -1,4 +1,5 @@
 'use strict';
+const { sendPinWelcomeEmail } = require('./email');
 /**
  * routes/billing.js — ISP-level Stripe billing, tenant provisioning
  */
@@ -175,6 +176,23 @@ module.exports = function billingRouter(DATA_DIR, loadSettings, getStripe, porta
           if (sess.metadata?.subscriberId) {
             d.prepare("UPDATE subscribers SET stripe_customer_id=COALESCE(@cid,stripe_customer_id),stripe_subscription_id=COALESCE(@sid,stripe_subscription_id),billing_status='active',plan=COALESCE(@plan,plan) WHERE id=@id")
               .run({ cid:sess.customer||null, sid:sess.subscription||null, plan:sess.metadata.plan||null, id:sess.metadata.subscriberId });
+            // Send welcome + PIN email now that billing_status is active
+            try {
+              const { createHash } = require('crypto');
+              const { subscriberFromRow } = require('../db');
+              const subRow = d.prepare('SELECT * FROM subscribers WHERE id=?').get(sess.metadata.subscriberId);
+              if (subRow) {
+                const sub = subscriberFromRow(subRow);
+                const pin = createHash('sha256').update(sub.id + sub.email).digest('hex').slice(-6).toUpperCase();
+                const settings = loadSettings();
+                sendPinWelcomeEmail({
+                  subscriber: sub, pin,
+                  ispName: settings.ispName || 'EtherOS',
+                  terminalUrl: `https://${settings.domain || 'edge.etheros.ai'}/isp-portal/#/terminal`,
+                  loadSettings,
+                }).catch(e => console.error('[webhook] PIN email failed:', e));
+              }
+            } catch (emailErr) { console.error('[webhook] PIN email error:', emailErr); }
           }
           // Auto-provision ISP tenant
           if (sess.metadata?.provision_type === 'new_isp' && sess.metadata?.isp_slug) {

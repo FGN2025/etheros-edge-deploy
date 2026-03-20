@@ -170,6 +170,8 @@ app.get('/api/services/blacknut/status', async (req, res) => {
 });
 
 // Subscriber self-signup (public) — inline to avoid path stripping
+const { sendPinWelcomeEmail, sendPinRecoveryEmail } = require('./routes/email');
+
 app.post('/api/subscribers/signup', rateLimiter(60_000, 10), async (req, res) => {
   const { name, email, plan = 'personal', successUrl, cancelUrl } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
@@ -220,11 +222,21 @@ app.post('/api/subscribers/signup', rateLimiter(60_000, 10), async (req, res) =>
       db.prepare('UPDATE subscribers SET stripe_checkout_session_id=?,billing_status=? WHERE id=?')
         .run(session.id, 'invited', subId);
       const created = subscriberFromRow(db.prepare('SELECT * FROM subscribers WHERE id=?').get(subId));
+      // No welcome email here — PIN email fires after checkout.session.completed webhook
       return res.status(201).json({ ok: true, requiresCheckout: true, checkoutUrl: session.url, subscriberId: subId, subscriber: created });
     } catch (err) { return res.status(500).json({ error: err.message }); }
   }
+  // Free path (no Stripe) — send welcome + PIN email immediately
   const created = subscriberFromRow(db.prepare('SELECT * FROM subscribers WHERE id=?').get(subId));
-  return res.status(201).json({ ok: true, requiresCheckout: false, subscriberId: subId, pin: subscriberPin(created), subscriber: created });
+  const pin = subscriberPin(created);
+  const settings = loadSettings();
+  sendPinWelcomeEmail({
+    subscriber: created, pin,
+    ispName: settings.ispName || 'EtherOS',
+    terminalUrl: portalUrl('/isp-portal/#/terminal'),
+    loadSettings,
+  }).catch(() => {}); // fire-and-forget
+  return res.status(201).json({ ok: true, requiresCheckout: false, subscriberId: subId, pin, subscriber: created });
 });
 
 // Stripe checkout result — MUST be before /:id routes to avoid param capture
@@ -291,6 +303,28 @@ app.get('/api/subscribers/:id/billing-summary', async (req, res) => {
     hasActiveSubscription: sub.billingStatus === 'active',
     plans: allPlans, stripePortalUrl,
   });
+});
+
+// PIN recovery — public, rate-limited: send PIN to email on file
+app.post('/api/subscribers/pin-recovery', rateLimiter(60_000, 5), async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email required' });
+  const { getDb, subscriberFromRow } = require('./db');
+  const { createHash } = require('crypto');
+  const db = getDb(DATA_DIR);
+  const row = db.prepare('SELECT * FROM subscribers WHERE email=?').get(email.trim().toLowerCase());
+  // Always return success to prevent email enumeration
+  if (!row) return res.json({ ok: true, sent: false });
+  const sub = subscriberFromRow(row);
+  const pin = createHash('sha256').update(sub.id + sub.email).digest('hex').slice(-6).toUpperCase();
+  const settings = loadSettings();
+  sendPinRecoveryEmail({
+    subscriber: sub, pin,
+    ispName: settings.ispName || 'EtherOS',
+    terminalUrl: portalUrl('/isp-portal/#/terminal'),
+    loadSettings,
+  }).catch(() => {});
+  return res.json({ ok: true, sent: true });
 });
 
 // Subscriber PIN auth (terminal login) — rate limited, inline to avoid path stripping
