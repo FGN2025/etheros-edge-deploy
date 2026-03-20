@@ -66,26 +66,13 @@ echo -e "${YELLOW}▸${NC} Writing docker-compose.override.yml..."
 
 OVERRIDE_FILE="$EDGE_DIR/docker-compose.override.yml"
 
+# Override only adds env vars to the existing service — no new services, no network refs
 cat > "$OVERRIDE_FILE" << OVERRIDE
 services:
   isp-portal-backend:
     environment:
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: etheros-ollama
-    restart: unless-stopped
-    volumes:
-      - ./data/ollama:/root/.ollama
-    networks:
-      - etheros-net
-    ports:
-      - "127.0.0.1:11434:11434"
-    environment:
-      - OLLAMA_KEEP_ALIVE=24h
-      - OLLAMA_NUM_PARALLEL=2
 OVERRIDE
 
 echo -e "  ${GREEN}✓${NC} docker-compose.override.yml written"
@@ -101,10 +88,30 @@ docker compose up -d --no-deps --force-recreate isp-portal-backend
 sleep 6
 echo -e "  ${GREEN}✓${NC} isp-portal-backend recreated"
 
-# ── Start Ollama ───────────────────────────────────────────────────────────────
+# ── Start Ollama (standalone docker run — not via compose) ────────────────────
 echo ""
-echo -e "${YELLOW}▸${NC} Starting Ollama service..."
-docker compose up -d ollama
+echo -e "${YELLOW}▸${NC} Starting Ollama container..."
+
+# Detect the compose network name (project_name + '_etheros-net' or just 'etheros-net')
+NETWORK=$(docker network ls --format '{{.Name}}' | grep -E 'etheros.net|etheros_net' | head -1 || echo "etheros-net")
+echo -e "  Using network: $NETWORK"
+
+mkdir -p "$EDGE_DIR/data/ollama"
+
+if docker ps -a --format '{{.Names}}' | grep -q '^etheros-ollama$'; then
+  echo -e "  ${YELLOW}⚠${NC}  etheros-ollama already exists — ensuring it's running"
+  docker start etheros-ollama 2>/dev/null || true
+else
+  docker run -d \
+    --name etheros-ollama \
+    --restart unless-stopped \
+    --network "$NETWORK" \
+    -v "$EDGE_DIR/data/ollama:/root/.ollama" \
+    -p 127.0.0.1:11434:11434 \
+    -e OLLAMA_KEEP_ALIVE=24h \
+    -e OLLAMA_NUM_PARALLEL=2 \
+    ollama/ollama:latest
+fi
 sleep 4
 OLLAMA_STATUS=$(docker ps --filter "name=etheros-ollama" --format "{{.Status}}" 2>/dev/null || echo "not found")
 echo -e "  Container: $OLLAMA_STATUS"
