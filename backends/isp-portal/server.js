@@ -227,6 +227,37 @@ app.post('/api/subscribers/signup', rateLimiter(60_000, 10), async (req, res) =>
   return res.status(201).json({ ok: true, requiresCheckout: false, subscriberId: subId, pin: subscriberPin(created), subscriber: created });
 });
 
+// Stripe checkout result — MUST be before /:id routes to avoid param capture
+// Public: returns PIN after Stripe redirect. Polls Stripe directly if webhook hasn't fired yet.
+app.get('/api/subscribers/checkout-result', rateLimiter(60_000, 15), async (req, res) => {
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).json({ error: 'session_id required' });
+  const { getDb, subscriberFromRow } = require('./db');
+  const { createHash } = require('crypto');
+  function subscriberPin(sub) {
+    return createHash('sha256').update(sub.id + sub.email).digest('hex').slice(-6).toUpperCase();
+  }
+  const db = getDb(DATA_DIR);
+  let row = db.prepare('SELECT * FROM subscribers WHERE stripe_checkout_session_id=?').get(session_id);
+  const stripe = getStripe();
+  if (stripe) {
+    try {
+      const sess = await stripe.checkout.sessions.retrieve(session_id);
+      if (sess.metadata?.subscriberId) {
+        row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(sess.metadata.subscriberId) || row;
+        if (sess.status === 'complete' && row) {
+          db.prepare("UPDATE subscribers SET billing_status='active' WHERE id=? AND billing_status IN ('none','invited')")
+            .run(row.id);
+          row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(row.id);
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+  if (!row) return res.status(404).json({ ok: false, error: 'Checkout session not found' });
+  const sub = subscriberFromRow(row);
+  res.json({ ok: true, subscriberId: sub.id, name: sub.name, plan: sub.plan, billingStatus: sub.billingStatus, pin: subscriberPin(sub) });
+});
+
 // Subscriber billing summary (Bearer token — subscriber self-service)
 app.get('/api/subscribers/:id/billing-summary', async (req, res) => {
   const auth = (req.headers.authorization || '').replace('Bearer ', '');
@@ -259,47 +290,6 @@ app.get('/api/subscribers/:id/billing-summary', async (req, res) => {
     cancelAtPeriodEnd: sub.cancelAtPeriodEnd, stripeCustomerId: sub.stripeCustomerId,
     hasActiveSubscription: sub.billingStatus === 'active',
     plans: allPlans, stripePortalUrl,
-  });
-});
-
-// Stripe checkout result — called after Stripe redirect back with session_id
-// Public: returns PIN if billing_status is now active (webhook may not have fired yet — polls Stripe directly)
-app.get('/api/subscribers/checkout-result', rateLimiter(60_000, 15), async (req, res) => {
-  const { session_id } = req.query;
-  if (!session_id) return res.status(400).json({ error: 'session_id required' });
-  const { getDb, subscriberFromRow } = require('./db');
-  const { createHash } = require('crypto');
-  function subscriberPin(sub) {
-    return createHash('sha256').update(sub.id + sub.email).digest('hex').slice(-6).toUpperCase();
-  }
-  const db = getDb(DATA_DIR);
-  // Find subscriber by checkout session ID
-  let row = db.prepare('SELECT * FROM subscribers WHERE stripe_checkout_session_id=?').get(session_id);
-  const stripe = getStripe();
-  // If Stripe is live, sync the session to get latest status
-  if (stripe) {
-    try {
-      const sess = await stripe.checkout.sessions.retrieve(session_id);
-      if (sess.metadata?.subscriberId) {
-        row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(sess.metadata.subscriberId) || row;
-        // Update billing status if Stripe says complete
-        if (sess.status === 'complete' && row) {
-          db.prepare("UPDATE subscribers SET billing_status='active' WHERE id=? AND billing_status IN ('none','invited')")
-            .run(row.id);
-          row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(row.id);
-        }
-      }
-    } catch { /* non-fatal — return whatever we have from DB */ }
-  }
-  if (!row) return res.status(404).json({ error: 'Checkout session not found' });
-  const sub = subscriberFromRow(row);
-  res.json({
-    ok: true,
-    subscriberId: sub.id,
-    name: sub.name,
-    plan: sub.plan,
-    billingStatus: sub.billingStatus,
-    pin: subscriberPin(sub),
   });
 });
 
