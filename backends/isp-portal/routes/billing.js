@@ -132,8 +132,9 @@ module.exports = function billingRouter(DATA_DIR, loadSettings, getStripe, porta
     if (!stripe) return res.status(400).json({ error: 'Stripe not configured' });
     const settings = loadSettings();
     const sig    = req.headers['stripe-signature'];
-    const secret = settings.stripeWebhookSecret?.trim();
-    if (!secret) return res.status(400).json({ error: 'Webhook secret not configured — add stripeWebhookSecret in Settings' });
+    // Prefer env var; fall back to settings UI value
+    const secret = (process.env.STRIPE_WEBHOOK_SECRET || settings.stripeWebhookSecret || '').trim();
+    if (!secret) return res.status(400).json({ error: 'Webhook secret not configured — add STRIPE_WEBHOOK_SECRET env var or set in Settings' });
     if (!sig)    return res.status(400).json({ error: 'Missing stripe-signature header' });
     let event;
     try {

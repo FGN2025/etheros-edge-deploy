@@ -51,8 +51,10 @@ function saveSettings(s) {
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
 }
 function getStripe() {
+  // Prefer environment variable (allows live/test switching without UI change)
+  const envKey = (process.env.STRIPE_SECRET_KEY || '').trim();
   const s = loadSettings();
-  const key = (s.stripeKey || '').trim();
+  const key = envKey || (s.stripeKey || '').trim();
   if (!key) return null;
   try {
     const Stripe = require('stripe');
@@ -257,6 +259,47 @@ app.get('/api/subscribers/:id/billing-summary', async (req, res) => {
     cancelAtPeriodEnd: sub.cancelAtPeriodEnd, stripeCustomerId: sub.stripeCustomerId,
     hasActiveSubscription: sub.billingStatus === 'active',
     plans: allPlans, stripePortalUrl,
+  });
+});
+
+// Stripe checkout result — called after Stripe redirect back with session_id
+// Public: returns PIN if billing_status is now active (webhook may not have fired yet — polls Stripe directly)
+app.get('/api/subscribers/checkout-result', rateLimiter(60_000, 15), async (req, res) => {
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).json({ error: 'session_id required' });
+  const { getDb, subscriberFromRow } = require('./db');
+  const { createHash } = require('crypto');
+  function subscriberPin(sub) {
+    return createHash('sha256').update(sub.id + sub.email).digest('hex').slice(-6).toUpperCase();
+  }
+  const db = getDb(DATA_DIR);
+  // Find subscriber by checkout session ID
+  let row = db.prepare('SELECT * FROM subscribers WHERE stripe_checkout_session_id=?').get(session_id);
+  const stripe = getStripe();
+  // If Stripe is live, sync the session to get latest status
+  if (stripe) {
+    try {
+      const sess = await stripe.checkout.sessions.retrieve(session_id);
+      if (sess.metadata?.subscriberId) {
+        row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(sess.metadata.subscriberId) || row;
+        // Update billing status if Stripe says complete
+        if (sess.status === 'complete' && row) {
+          db.prepare("UPDATE subscribers SET billing_status='active' WHERE id=? AND billing_status IN ('none','invited')")
+            .run(row.id);
+          row = db.prepare('SELECT * FROM subscribers WHERE id=?').get(row.id);
+        }
+      }
+    } catch { /* non-fatal — return whatever we have from DB */ }
+  }
+  if (!row) return res.status(404).json({ error: 'Checkout session not found' });
+  const sub = subscriberFromRow(row);
+  res.json({
+    ok: true,
+    subscriberId: sub.id,
+    name: sub.name,
+    plan: sub.plan,
+    billingStatus: sub.billingStatus,
+    pin: subscriberPin(sub),
   });
 });
 
