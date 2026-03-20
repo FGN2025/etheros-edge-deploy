@@ -67,10 +67,8 @@ echo -e "${YELLOW}▸${NC} Writing docker-compose.override.yml..."
 OVERRIDE_FILE="$EDGE_DIR/docker-compose.override.yml"
 
 cat > "$OVERRIDE_FILE" << OVERRIDE
-version: '3.8'
-
 services:
-  etheros-isp-portal-backend:
+  isp-portal-backend:
     environment:
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
@@ -99,7 +97,7 @@ mkdir -p "$EDGE_DIR/data/ollama"
 echo ""
 echo -e "${YELLOW}▸${NC} Recreating isp-portal-backend with Stripe env vars..."
 cd "$EDGE_DIR"
-docker compose up -d --no-deps --force-recreate etheros-isp-portal-backend
+docker compose up -d --no-deps --force-recreate isp-portal-backend
 sleep 6
 echo -e "  ${GREEN}✓${NC} isp-portal-backend recreated"
 
