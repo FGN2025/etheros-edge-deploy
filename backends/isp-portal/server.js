@@ -505,6 +505,73 @@ app.get('/api/billing/plans', (req, res) => {
 // Chat stream — subscriber token auth enforced inside the router
 app.use('/api/chat', chatRouter);
 
+// ── Subscriber chat history — subscriber Bearer token auth (NOT admin auth) ──
+// These must be declared BEFORE the admin-auth block below.
+(function() {
+  function parseSubToken(t) {
+    try {
+      const [id, ts] = Buffer.from(t, 'base64url').toString('utf8').split('.');
+      if (!id || Date.now() - parseInt(ts, 10) > 8 * 3600_000) return null;
+      return id;
+    } catch { return null; }
+  }
+  function subAuth(req, res) {
+    const token = (req.headers.authorization || '').replace('Bearer ', '');
+    const id = parseSubToken(token);
+    if (!id || id !== req.params.id) { res.status(401).json({ error: 'Invalid or expired session' }); return null; }
+    return id;
+  }
+
+  // GET /api/subscribers/:id/chats — list recent conversations
+  app.get('/api/subscribers/:id/chats', (req, res) => {
+    if (!subAuth(req, res)) return;
+    const { getDb, agentFromRow } = require('./db');
+    const d = getDb(DATA_DIR);
+    const rows = d.prepare('SELECT agent_id,role,content,timestamp FROM chat_messages WHERE subscriber_id=? ORDER BY timestamp ASC').all(req.params.id);
+    const map = {};
+    for (const r of rows) { if (!map[r.agent_id]) map[r.agent_id] = []; map[r.agent_id].push(r); }
+    const agentRows = d.prepare('SELECT * FROM agents').all();
+    const agentMap = Object.fromEntries(agentRows.map(a => [a.id, a]));
+    const conversations = Object.entries(map).map(([agentId, msgs]) => {
+      const last = msgs[msgs.length - 1];
+      const agent = agentMap[agentId];
+      return { agentId, agentName: agent?.name || agentId, agentCategory: agent?.category || null, messageCount: msgs.length, lastMessage: { role: last.role, content: last.content.slice(0, 120), timestamp: last.timestamp } };
+    }).filter(c => c.lastMessage).sort((a, b) => new Date(b.lastMessage.timestamp) - new Date(a.lastMessage.timestamp));
+    res.json({ conversations });
+  });
+
+  // GET /api/subscribers/:id/chats/:agentId — get messages for one agent
+  app.get('/api/subscribers/:id/chats/:agentId', (req, res) => {
+    if (!subAuth(req, res)) return;
+    const { getDb } = require('./db');
+    const rows = getDb(DATA_DIR).prepare('SELECT role,content,timestamp FROM chat_messages WHERE subscriber_id=? AND agent_id=? ORDER BY timestamp ASC').all(req.params.id, req.params.agentId);
+    res.json({ messages: rows.slice(-50), total: rows.length });
+  });
+
+  // POST /api/subscribers/:id/chats/:agentId — save a message
+  app.post('/api/subscribers/:id/chats/:agentId', (req, res) => {
+    if (!subAuth(req, res)) return;
+    const { role, content } = req.body || {};
+    if (!role || !content) return res.status(400).json({ error: 'role and content required' });
+    if (!['user', 'assistant'].includes(role)) return res.status(400).json({ error: 'role must be user or assistant' });
+    const { getDb } = require('./db');
+    const d = getDb(DATA_DIR);
+    const ts = new Date().toISOString();
+    d.prepare('INSERT INTO chat_messages (subscriber_id,agent_id,role,content,timestamp) VALUES (?,?,?,?,?)').run(req.params.id, req.params.agentId, role, content, ts);
+    d.prepare('DELETE FROM chat_messages WHERE id IN (SELECT id FROM chat_messages WHERE subscriber_id=? AND agent_id=? ORDER BY id ASC LIMIT MAX(0,(SELECT COUNT(*) FROM chat_messages WHERE subscriber_id=? AND agent_id=?)-100))').run(req.params.id, req.params.agentId, req.params.id, req.params.agentId);
+    const total = d.prepare('SELECT COUNT(*) as n FROM chat_messages WHERE subscriber_id=? AND agent_id=?').get(req.params.id, req.params.agentId).n;
+    res.json({ ok: true, message: { role, content, timestamp: ts }, total });
+  });
+
+  // DELETE /api/subscribers/:id/chats/:agentId — clear history
+  app.delete('/api/subscribers/:id/chats/:agentId', (req, res) => {
+    if (!subAuth(req, res)) return;
+    const { getDb } = require('./db');
+    getDb(DATA_DIR).prepare('DELETE FROM chat_messages WHERE subscriber_id=? AND agent_id=?').run(req.params.id, req.params.agentId);
+    res.json({ ok: true });
+  });
+})();
+
 // ════════════════════════════════════════════════════════════════════════════
 // ── SECTION 2: PROTECTED routes — admin token required ───────────────────────
 // ════════════════════════════════════════════════════════════════════════════
