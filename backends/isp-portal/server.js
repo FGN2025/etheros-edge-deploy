@@ -368,6 +368,66 @@ app.get('/api/subscribers/me', (req, res) => {
   res.json(subscriberFromRow(row));
 });
 
+// POST /api/subscribers/:id/agents/:agentId — activate an agent for a subscriber
+app.post('/api/subscribers/:id/agents/:agentId', (req, res) => {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const { getDb, agentFromRow, subscriberFromRow } = require('./db');
+  function parseSubscriberToken(t) {
+    try {
+      const [sid, ts] = Buffer.from(t, 'base64url').toString('utf8').split('.');
+      if (!sid || Date.now() - parseInt(ts, 10) > 8 * 3600_000) return null;
+      return sid;
+    } catch { return null; }
+  }
+  const PLAN_AGENT_LIMITS = { personal: 3, professional: 10, charter: 999 };
+  const tokenId = parseSubscriberToken(token);
+  if (!tokenId || tokenId !== req.params.id) return res.status(401).json({ error: 'Invalid or expired session' });
+  const db = getDb(DATA_DIR);
+  const subRow = db.prepare('SELECT * FROM subscribers WHERE id=?').get(req.params.id);
+  if (!subRow) return res.status(404).json({ error: 'Subscriber not found' });
+  const sub = subscriberFromRow(subRow);
+  const agentRow = db.prepare("SELECT * FROM agents WHERE id=? AND is_enabled=1 AND status='live'").get(req.params.agentId);
+  if (!agentRow) return res.status(404).json({ error: 'Agent not found' });
+  const agent = agentFromRow(agentRow);
+  // Check plan limit
+  const limit = PLAN_AGENT_LIMITS[sub.plan] || 3;
+  const activeIds = [...sub.activeAgentIds];
+  if (activeIds.includes(req.params.agentId)) return res.json({ ok: true, activeAgentIds: activeIds }); // already active
+  if (activeIds.length >= limit) return res.status(402).json({ error: 'Agent slot limit reached', limitReached: true, limit });
+  // Add-on billing check (stub — always allow in test mode)
+  if (agent.pricingType === 'addon' && agent.priceMonthly > 0) {
+    // Future: charge via Stripe. For now allow if plan is active.
+    if (sub.billingStatus !== 'active') {
+      return res.status(402).json({ requiresBilling: true, agentName: agent.name, priceMonthly: agent.priceMonthly });
+    }
+  }
+  activeIds.push(req.params.agentId);
+  db.prepare('UPDATE subscribers SET active_agent_ids=? WHERE id=?').run(JSON.stringify(activeIds), req.params.id);
+  res.json({ ok: true, activeAgentIds: activeIds });
+});
+
+// DELETE /api/subscribers/:id/agents/:agentId — deactivate an agent for a subscriber
+app.delete('/api/subscribers/:id/agents/:agentId', (req, res) => {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const { getDb, subscriberFromRow } = require('./db');
+  function parseSubscriberToken(t) {
+    try {
+      const [sid, ts] = Buffer.from(t, 'base64url').toString('utf8').split('.');
+      if (!sid || Date.now() - parseInt(ts, 10) > 8 * 3600_000) return null;
+      return sid;
+    } catch { return null; }
+  }
+  const tokenId = parseSubscriberToken(token);
+  if (!tokenId || tokenId !== req.params.id) return res.status(401).json({ error: 'Invalid or expired session' });
+  const db = getDb(DATA_DIR);
+  const subRow = db.prepare('SELECT * FROM subscribers WHERE id=?').get(req.params.id);
+  if (!subRow) return res.status(404).json({ error: 'Subscriber not found' });
+  const sub = subscriberFromRow(subRow);
+  const activeIds = sub.activeAgentIds.filter(id => id !== req.params.agentId);
+  db.prepare('UPDATE subscribers SET active_agent_ids=? WHERE id=?').run(JSON.stringify(activeIds), req.params.id);
+  res.json({ ok: true, activeAgentIds: activeIds });
+});
+
 // Agent browse — terminal marketplace (inline to avoid path stripping)
 app.get('/api/agents/browse', (req, res) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
