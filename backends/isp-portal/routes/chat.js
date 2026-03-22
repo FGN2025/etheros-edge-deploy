@@ -40,7 +40,7 @@ function createChatRouter(helpers) {
       ...messages,
     ];
 
-    const ollamaModel = model || 'llama3.1:8b';
+    const ollamaModel = model || 'llama3.2:3b';
 
     try {
       const upstream = await fetch(OLLAMA_URL, {
