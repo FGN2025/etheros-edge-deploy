@@ -20,7 +20,8 @@ function createChatRouter(helpers) {
   const OLLAMA_URL = 'http://etheros-ollama:11434/api/chat';
 
   // ── POST /api/chat/stream ─────────────────────────────────────────────────
-  router.post('/chat/stream', async (req, res) => {
+  // Router is mounted at /api/chat so this path becomes /api/chat/stream
+  router.post('/stream', async (req, res) => {
     // Validate subscriber session token
     const auth  = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
